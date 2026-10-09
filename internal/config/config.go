@@ -348,6 +348,10 @@ type Settings struct {
 	// PrePrompts 是 "scenario" 模式下的按模态前置提示词：key 为 text/image/video，
 	// 命中即用对应提示词覆盖 system；缺省回退 SystemPromptOverride，再回退内置默认。
 	PrePrompts map[string]string `json:"pre_prompts,omitempty"`
+	// RawCaptureEnabled 开启后，网关将【客户端发来的完整原始请求体】
+	// （未经 system_prompt_policy 改写、未截断）落到 data/raw_capture/ 目录，
+	// 每个请求一个文件，用于排障与「请求字段全量分析」。默认 false（关闭）。
+	RawCaptureEnabled bool `json:"raw_capture_enabled"`
 	ChatPasswordHash     string `json:"chat_password_hash,omitempty"`
 	ChatPasswordSalt     string `json:"chat_password_salt,omitempty"`
 }
@@ -1988,4 +1992,38 @@ func subtleEqual(a, b string) bool {
 		diff |= a[i] ^ b[i]
 	}
 	return diff == 0
+}
+
+// ---------------------------------------------------------------------------
+// 原始请求全量捕获（RawCapture）——排障与「请求字段全量分析」专用
+// ---------------------------------------------------------------------------
+
+// CaptureRawRequest 把客户端发来的【完整原始请求体】（未经 system_prompt_policy
+// 改写、未截断）落到 data/raw_capture/ 目录，每个请求一个文件，文件名带纳秒时间戳。
+// 用于排障与「请求字段全量分析」。最多保留 100 个文件，超出删除最旧，避免写爆磁盘。
+// 调用方应先判断 st.RawCaptureEnabled，避免每请求无谓走读锁。
+func (s *Store) CaptureRawRequest(raw []byte) {
+	if len(raw) == 0 {
+		return
+	}
+	dir := filepath.Join(s.Dir, "raw_capture")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	// 限制文件数：超过 100 则删除最旧文件（按文件名排序，纳秒时间戳天然升序）。
+	if entries, err := os.ReadDir(dir); err == nil && len(entries) >= 100 {
+		olds := make([]string, 0, len(entries))
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			olds = append(olds, filepath.Join(dir, e.Name()))
+		}
+		sort.Strings(olds)
+		for i := 0; i < len(olds)-99; i++ {
+			_ = os.Remove(olds[i])
+		}
+	}
+	name := filepath.Join(dir, fmt.Sprintf("req_%d.json", time.Now().UnixNano()))
+	_ = os.WriteFile(name, raw, 0o644)
 }

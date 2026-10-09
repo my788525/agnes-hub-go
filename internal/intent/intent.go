@@ -339,6 +339,29 @@ func ExtractPrompt(body map[string]any) Prompt {
 	return Prompt{Text: strings.TrimSpace(strings.Join(texts, "\n")), Images: images}
 }
 
+// CleanUserMessage 从一条 user 消息原文中剥离 WorkBuddy 等客户端注入的系统开销，
+// 只保留用户真正输入的部分，用于「查看请求」日志展示。
+//
+// 行为：
+//  1. 若内含 <user_query>...</user_query> 包裹（WorkBuddy 的常规形态），取其内部文本——
+//     这是最精确的用户输入，已天然排除了包裹在外层的 <system-reminder> 等注入。
+//  2. 否则去掉所有 <system-reminder ...>...</system-reminder> 块后返回剩余文本。
+//  3. 普通 chat 请求（user 消息本身即纯文本、无上述包裹）原样透传，清理为零副作用。
+func CleanUserMessage(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	if m := userQueryRe.FindStringSubmatch(raw); m != nil {
+		return strings.TrimSpace(m[1])
+	}
+	return strings.TrimSpace(systemReminderRe.ReplaceAllString(raw, ""))
+}
+
+var (
+	userQueryRe      = regexp.MustCompile(`(?s)<user_query>(.*?)</user_query>`)
+	systemReminderRe = regexp.MustCompile(`(?s)<system-reminder[^>]*>.*?</system-reminder>`)
+)
+
 // videoNounRe / imageNounRe / generateVerbRe 用于组合信号判定。
 //
 // 单靠「出现『视频』二字」会误伤「视频压缩工具推荐」「视频号怎么开」这类

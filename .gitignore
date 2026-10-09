@@ -23,6 +23,14 @@ data/
 .probe/
 __pycache__/
 
+# 本机 Go 工具链与交叉编译临时产物（.gotmp 内含下载的 go/ 与中间二进制，绝不入库）
+.gotmp/
+
+# 请求字段分析交付报告（含从网关抓取的真实 system 提示词与记忆内容，私有，不入库）
+.workbuddy/request_full_analysis.html
+.workbuddy/request_fields_full.html
+.workbuddy/request_strip_analysis.html
+
 # NAS 口令（tools/deploy_nas.py 会读它，绝不提交）
 .nas_pass
 

@@ -209,6 +209,41 @@ func TestExtractPromptAcceptsTypedMessageSlice(t *testing.T) {
 	}
 }
 
+// TestCleanUserMessage 验证「查看请求」日志只保留用户真实输入，剥离客户端注入的系统开销。
+func TestCleanUserMessage(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "workbuddy 包裹：剥离 system-reminder 只取 user_query",
+			in:   "<system-reminder>cra\u200bft_mode ...</system-reminder>\n<system-reminder>current_time ...</system-reminder>\n<user_query>系统盘压缩可以加上吗？收益大吗</user_query>",
+			want: "系统盘压缩可以加上吗？收益大吗",
+		},
+		{
+			name: "无 user_query：去掉 system-reminder 后取剩余",
+			in:   "<system-reminder>memory reminder</system-reminder>\n帮我画一张产品海报",
+			want: "帮我画一张产品海报",
+		},
+		{
+			name: "普通 chat 请求：无包裹原样透传",
+			in:   "把这张图改成水彩风格",
+			want: "把这张图改成水彩风格",
+		},
+		{
+			name: "空输入",
+			in:   "",
+			want: "",
+		},
+	}
+	for _, c := range cases {
+		if got := CleanUserMessage(c.in); got != c.want {
+			t.Errorf("[%s] CleanUserMessage = %q，期望 %q", c.name, got, c.want)
+		}
+	}
+}
+
 func TestChooseModelNeverEscapesDeclaredList(t *testing.T) {
 	declared := []string{"agnes-image-2.1-flash"}
 	pref := []string{"agnes-image-2.5-flash", "agnes-image-2.1-flash"}

@@ -318,6 +318,8 @@ exit 0
 TRIVIAL = "#!/bin/bash\nexit 0\n"
 
 CHANGELOG = (
+    "1.0.20：修复控制台用量日志「查看请求」弹窗显示内容——此前直接展示最后一条 user 消息的完整原文（含 WorkBuddy 注入的 <system-reminder> 等多层系统开销）；"
+    "现落盘前用 intent.CleanUserMessage 剥离 system-reminder、只取 <user_query> 内的真实用户输入，普通 chat 请求（无包裹）原样透传、零副作用；弹窗因此只显示用户消息本身。"
     "1.0.19：新增「上游上下文策略（系统提示词）」——控制发给上游模型的 system 提示词如何处理，且【只动 system 内容，工具调用与思考能力始终保留】；"
     "默认 forward（原样转发，零回归）；可选 仅剥离 system（最省 token）/ 覆盖为自定义提示词 / 按情景匹配前置提示词；"
     "override 与 scenario 为空时回退内置「代码生成」默认提示词（面向在 WorkBuddy 上写代码优化）；控制台设置页新增对应卡片（模式下拉 + 自定义提示词框）；"

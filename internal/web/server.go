@@ -604,6 +604,11 @@ func (s *Server) handleTextish(w http.ResponseWriter, r *http.Request, path stri
 		return
 	}
 	settings := s.Store.SettingsSnapshot()
+	// #27：原始请求全量捕获（排障/请求字段分析用）：在 system_prompt_policy 改写前，
+	// 把 WorkBuddy 发来的完整原始请求体落盘，便于逐字段翻译分析。默认关闭。
+	if settings.RawCaptureEnabled {
+		s.Store.CaptureRawRequest(rawBody)
+	}
 	// #26：按「上游上下文策略」调整发给上游的 system 提示词（默认 forward 不改动）。
 	// 工具调用 / 思考等能力字段一律保留，只剥离或替换 system 内容，避免误伤。
 	if settings.SystemPromptPolicy != "" && settings.SystemPromptPolicy != "forward" {
@@ -708,12 +713,16 @@ func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request, path, modal
 		writeErr(w, e)
 		return
 	}
-	body, _, e := readBody(r)
+	body, rawBody, e := readBody(r)
 	if e != nil {
 		writeErr(w, e)
 		return
 	}
 	settings := s.Store.SettingsSnapshot()
+	// #27：原始请求全量捕获（排障/请求字段分析用），在 system_prompt_policy 改写前落盘。
+	if settings.RawCaptureEnabled {
+		s.Store.CaptureRawRequest(rawBody)
+	}
 	// #26：媒体端点同样按上下文策略处理 system（媒体体通常无 system，剥离为 no-op；
 	// override/scenario 注入的 system 信息对图像/视频 API 无害，会被忽略）。
 	if settings.SystemPromptPolicy != "" && settings.SystemPromptPolicy != "forward" {
@@ -1431,10 +1440,10 @@ func (s *Server) logUsageFull(item *config.DownstreamKey, decision intent.Result
 	if account != nil {
 		acctName, acctID = account.Name, account.ID
 	}
-	// 用户提出的完整请求：截断到配置上限（UsageRequestLogBytes，默认 512），
-	// 避免图文/视频 base64 把日志撑爆。注意此处记录的是「用户真正提交的原文」
-	// （已在调用处传入 decision.Prompt.Text），已排除 system 提示词等上下文。
-	ur := requestLog(userRequest, s.Store.SettingsSnapshot().UsageRequestLogBytes)
+	// 用户提出的完整请求：先剥离 WorkBuddy 注入的 <system-reminder> 等系统开销、
+	// 只保留 <user_query> 内的真实用户输入（CleanUserMessage 对普通 chat 请求零副作用），
+	// 再截断到配置上限（UsageRequestLogBytes，默认 512），避免图文/视频 base64 把日志撑爆。
+	ur := requestLog(intent.CleanUserMessage(userRequest), s.Store.SettingsSnapshot().UsageRequestLogBytes)
 	s.Store.AppendUsage(map[string]any{
 		"ts": time.Now().Format("2006-01-02 15:04:05"), "phase": "done",
 		"endpoint": path, "pool_class": poolClass,
