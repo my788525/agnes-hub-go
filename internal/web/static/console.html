@@ -668,7 +668,7 @@ function showUserRequest(i){
       <div class="modal reqbox">
         <div class="spread"><h2>用户提出的完整请求</h2>
           <button class="sm" onclick="closeModal()">✕</button></div>
-        ${trunc?`<div class="trunc">⚠ 该字段在落盘时已被截断到上限（仅保留前 N 字节），完整原文未持久化；以下为已保留部分。</div>`:""}
+        ${truncated?`<div class="trunc">⚠ 该字段在落盘时已被截断到上限（仅保留前 N 字节），完整原文未持久化；以下为已保留部分。</div>`:""}
         <div class="bar">
           <button class="sm" onclick="copyUserRequest(${i})">复制全文</button>
           <span class="muted" style="font-size:12px">${(raw.length/1024).toFixed(1)} KB</span>

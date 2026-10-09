@@ -2,6 +2,7 @@
 # Go 链接器覆盖运行中的 exe 时留下的备份
 *.exe~
 *.exe
+build/
 agnes-hub-go
 agnes-hub-go-linux-amd64
 agnes-hub-go-linux-arm64
