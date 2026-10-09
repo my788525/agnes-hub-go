@@ -761,7 +761,27 @@ function viewSettings(){
   const fld = (id,label,val,type="number",hint="")=>`
     <div><label>${label}</label><input id="${id}" type="${type}" value="${esc(val)}">
     ${hint?`<div class="hint">${hint}</div>`:""}</div>`;
+  const scenarios = state.scenarios || [];
+  const scOpts = scenarios.map(p=>`<option value="${esc(p.name)}" ${s.scenario===p.name?"selected":""}>${esc(p.name)} · ${esc(p.desc)}</option>`).join("");
   return `
+  <div class="card" style="border-color:var(--accent,#3b82f6)">
+    <h2>运行情景（按网关执行方向一键侧重）</h2>
+    <div class="muted" style="margin-bottom:10px">选一个情景，网关会按该方向自动调安全阀 / 文本 RPM / 重试 / 队列 / 并发等旋钮并即时生效；账号级 RPM 覆盖仍优先，不被冲掉。参数按 8 个免费号基准设计。</div>
+    <div class="row" style="gap:10px;align-items:flex-end">
+      <div><label>当前情景</label>
+        <select id="s_scenario" style="min-width:320px">${scOpts||`<option value="default">default · 默认均衡</option>`}</select>
+        <div class="hint">切到「多任务并行」默认打开两级队列（短调用优先）；「挂机批量」拉高空闲容忍与队列。</div>
+      </div>
+      <button class="primary" id="btnApplyScenario">一键应用</button>
+    </div>
+    <div style="margin-top:10px">
+      <label style="display:flex;gap:6px;align-items:center">
+        <input type="checkbox" id="s_two_level" ${s.text_two_level_queue?"checked":""}>
+        文本两级队列：同池内非流式（工具/短调用）优先于流式（长生成）出队
+      </label>
+      <div class="hint">仅改出队顺序、不破坏该池 RPM 节拍；多任务并发卡顿明显时打开。</div>
+    </div>
+  </div>
   <div class="card">
     <h2>统一模型入口（auto）</h2>
     <div class="grid g2">
@@ -878,7 +898,9 @@ function bindSettingsEvents(){
       probe_model:g("s_probe"), session_ttl_hours:Number(g("s_ttl")),
       optimization_mode:g("s_opt_mode"), image_record_retention_days:Number(g("s_img_ret")),
       image_max_capacity:Number(g("s_img_cap")), video_max_capacity:Number(g("s_vid_cap")),
-      free_text_rpm:Number(g("s_free_text_rpm"))
+      free_text_rpm:Number(g("s_free_text_rpm")),
+      scenario:g("s_scenario"),
+      text_two_level_queue:document.getElementById("s_two_level")?document.getElementById("s_two_level").checked:false
     };
     MODALITIES.forEach(m=>payload.auto_intent.preferred_models[m] =
       g("s_pref_"+m).split(",").map(x=>x.trim()).filter(Boolean));
@@ -892,6 +914,17 @@ function bindSettingsEvents(){
   };
   document.getElementById("btnExport").onclick = exp(true);
   document.getElementById("btnExportFull").onclick = exp(true);
+  const applySc = document.getElementById("btnApplyScenario");
+  if(applySc) applySc.onclick = async ()=>{
+    const name = document.getElementById("s_scenario").value;
+    if(!name){ toast("请选择一个情景","warn"); return; }
+    try{
+      // 只发 scenario（后端 ApplyScenario 覆写整套旋钮），保留账号级 RPM 覆盖。
+      await api("/api/settings",{method:"POST",body:JSON.stringify({scenario:name})});
+      toast(`已应用「${name}」情景并即时生效`,"good");
+      await refresh();
+    }catch(e){ toast(e.message,"bad"); }
+  };
   document.getElementById("btnImport").onclick = async ()=>{
     const text = prompt("粘贴导出的 JSON（会追加账号，不覆盖现有）"); if(!text) return;
     try{
@@ -906,13 +939,15 @@ function bindSettingsEvents(){
 /* ---------------- 数据拉取 ---------------- */
 async function refresh(){
   try{
-    const [stats, accounts, keys, logs, settings, jobs, bindings] = await Promise.all([
+    const [stats, accounts, keys, logs, settings, jobs, bindings, scenarios] = await Promise.all([
       api("/api/stats"), api("/api/accounts"), api("/api/keys"), api("/api/logs?limit=300"),
-      api("/api/settings"), api("/api/video-jobs"), api("/api/bindings")
+      api("/api/settings"), api("/api/video-jobs"), api("/api/bindings"),
+      api("/api/scenarios").catch(()=>({scenarios:[]}))
     ]);
     state.stats = stats; state.accounts = accounts; state.keys = keys.keys||[];
     state.logs = logs.logs||[]; state.settings = settings;
     state.jobs = jobs.jobs||[]; state.bindings = bindings.bindings||[];
+    state.scenarios = scenarios.scenarios||[];
     state.stats.queue = (await api("/api/queue")).queue||[];
     const m = stats.metrics||{};
     document.getElementById("subline").textContent =

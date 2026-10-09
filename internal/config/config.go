@@ -312,6 +312,14 @@ type Settings struct {
 	// UsageRequestLogBytes 是日志里「用户提出的完整请求」保留的最大字节数，
 	// 超过即截断（默认 512，排障够用且不撑爆日志）。
 	UsageRequestLogBytes int `json:"usage_request_log_bytes"`
+	// Scenario 记录当前激活的「情景模式」名（default/code/image/auto/multi/batch）。
+	// 情景模式 = 一组网关参数包，一键应用后这些旋钮会被覆写成该情景侧重方向；
+	// 账号级 RPMOverrides 永远优先于情景包，不被冲掉。
+	Scenario string `json:"scenario,omitempty"`
+	// TextTwoLevelQueue 开启文本池「两级队列」：同一池内非流式（工具/短调用）
+	// 优先于流式（长生成）出队，只改出队顺序、不破坏该池 RPM 安全节拍。
+	// 多任务并行情景默认开启。
+	TextTwoLevelQueue bool `json:"text_two_level_queue"`
 	ChatPasswordHash     string `json:"chat_password_hash,omitempty"`
 	ChatPasswordSalt     string `json:"chat_password_salt,omitempty"`
 }
@@ -379,6 +387,123 @@ func DefaultSettings() Settings {
 }
 
 // ---------------------------------------------------------------------------
+// 情景模式（Scenario）——按网关主要执行方向一键侧重
+//
+// 设计口径：情景不是新模式，而是「一组网关参数包」。应用某情景即覆写 Settings
+// 的若干旋钮（Safety / 文本 RPM / 重试 / 队列 / 并发 / 两级队列 …），随后走
+// Hub.Reload() 热重载即时生效、免重启。
+//
+// 优先级：账号级 RPMOverrides 永远优先于情景包（applyScenario 只写全局 Settings
+// 旋钮，不碰账号字段），因此你手工给某号调的 RPM 不会被情景冲掉。
+//
+// 参数按「8 个免费号」基准设计（池级吞吐 = 单号 RPM × 8 × Safety）。
+// ---------------------------------------------------------------------------
+
+// ScenarioPreset 是一个情景的参数包。
+type ScenarioPreset struct {
+	Name        string   `json:"name"`
+	Desc        string   `json:"desc"`
+	Safety      float64  `json:"safety_factor"`
+	FreeTextRPM float64  `json:"free_text_rpm"`
+	RetryMax    int      `json:"retry_max"`
+	RetryBaseMS int      `json:"retry_base_backoff_ms"`
+	RetryCapMS  int      `json:"retry_max_backoff_ms"`
+	QueueSize   int      `json:"queue_max_size"`
+	QueueWaitMS int      `json:"queue_max_wait_ms"`
+	ImageConc   int      `json:"image_concurrency"`
+	VideoInFlt  int      `json:"video_max_inflight"`
+	StreamIdle  int      `json:"stream_idle_timeout_ms"`
+	TwoLevel    bool     `json:"text_two_level_queue"`
+	Region      string   `json:"region_priority"`
+}
+
+// ScenarioPresets 返回全部情景参数包（顺序即控制台展示顺序）。
+// 8 免费号基准：text 池级 ≈ 10×8×safety，image_1k ≈ 20×8×safety。
+func ScenarioPresets() []ScenarioPreset {
+	return []ScenarioPreset{
+		{
+			Name: "default", Desc: "默认均衡：各池按官方节奏跑，不做激进侧重",
+			Safety: 0.9, FreeTextRPM: 10, RetryMax: 3, RetryBaseMS: 500, RetryCapMS: 8000,
+			QueueSize: 200, QueueWaitMS: 120000, ImageConc: 4, VideoInFlt: 2,
+			StreamIdle: 60000, TwoLevel: false, Region: "cn_first",
+		},
+		{
+			Name: "code", Desc: "代码编写：文本高优、首字节延迟优先；重试更快、生图/视频让路",
+			Safety: 0.95, FreeTextRPM: 10, RetryMax: 3, RetryBaseMS: 400, RetryCapMS: 4000,
+			QueueSize: 200, QueueWaitMS: 60000, ImageConc: 2, VideoInFlt: 1,
+			StreamIdle: 60000, TwoLevel: false, Region: "cn_first",
+		},
+		{
+			Name: "image", Desc: "图片生成：拉满 8 号并发生图，文本降档给生图让路",
+			Safety: 0.9, FreeTextRPM: 6, RetryMax: 3, RetryBaseMS: 500, RetryCapMS: 8000,
+			QueueSize: 200, QueueWaitMS: 120000, ImageConc: 8, VideoInFlt: 1,
+			StreamIdle: 60000, TwoLevel: false, Region: "cn_first",
+		},
+		{
+			Name: "auto", Desc: "自动判断：文本/生图/生视频均衡，交给意图判定路由",
+			Safety: 0.9, FreeTextRPM: 10, RetryMax: 3, RetryBaseMS: 500, RetryCapMS: 8000,
+			QueueSize: 200, QueueWaitMS: 120000, ImageConc: 4, VideoInFlt: 2,
+			StreamIdle: 60000, TwoLevel: false, Region: "cn_first",
+		},
+		{
+			Name: "multi", Desc: "多任务并行：多任务横向吃满 8 号，队列更深、429 退避保守、开两级队列（短调用优先）",
+			Safety: 0.85, FreeTextRPM: 10, RetryMax: 3, RetryBaseMS: 800, RetryCapMS: 12000,
+			QueueSize: 500, QueueWaitMS: 180000, ImageConc: 4, VideoInFlt: 2,
+			StreamIdle: 60000, TwoLevel: true, Region: "cn_first",
+		},
+		{
+			Name: "batch", Desc: "挂机批量：无人值守长跑，多等少错、最长空闲容忍，吞吐拉满",
+			Safety: 0.85, FreeTextRPM: 10, RetryMax: 3, RetryBaseMS: 1000, RetryCapMS: 15000,
+			QueueSize: 500, QueueWaitMS: 300000, ImageConc: 4, VideoInFlt: 2,
+			StreamIdle: 120000, TwoLevel: false, Region: "cn_first",
+		},
+	}
+}
+
+// ScenarioNames 返回全部情景 ID（供控制台/校验）。
+func ScenarioNames() []string {
+	outs := make([]string, 0, len(ScenarioPresets()))
+	for _, p := range ScenarioPresets() {
+		outs = append(outs, p.Name)
+	}
+	return outs
+}
+
+// FindScenario 按名取情景包；找不到返回 false。
+func FindScenario(name string) (ScenarioPreset, bool) {
+	for _, p := range ScenarioPresets() {
+		if p.Name == name {
+			return p, true
+		}
+	}
+	return ScenarioPreset{}, false
+}
+
+// ApplyScenario 把某情景的参数包覆写进 Settings（调用方负责落盘 + Hub.Reload）。
+// 只改全局旋钮，绝不碰账号级字段（RPMOverrides / 各池 RPM），保证账号级优先。
+// 返回 false 表示未知情景（不改任何字段）。
+func ApplyScenario(st *Settings, name string) bool {
+	p, ok := FindScenario(name)
+	if !ok {
+		return false
+	}
+	st.SafetyFactor = p.Safety
+	st.FreeTextRPM = p.FreeTextRPM
+	st.RetryMax = p.RetryMax
+	st.RetryBaseBackoffMS = p.RetryBaseMS
+	st.RetryMaxBackoffMS = p.RetryCapMS
+	st.QueueMaxSize = p.QueueSize
+	st.QueueMaxWaitMS = p.QueueWaitMS
+	st.ImageConcurrency = p.ImageConc
+	st.VideoMaxInFlight = p.VideoInFlt
+	st.StreamIdleTimeoutMS = p.StreamIdle
+	st.TextTwoLevelQueue = p.TwoLevel
+	st.RegionPriority = p.Region
+	st.Scenario = p.Name
+	return true
+}
+
+// ---------------------------------------------------------------------------
 // Store
 // ---------------------------------------------------------------------------
 
@@ -396,6 +521,14 @@ type Store struct {
 	// usageLineCount 是 usage.jsonl 的累计行数（进程内估计，启动时从文件读一次，
 	// 之后按追加行数增长）。P1-1 用它触发滚动截断，避免长期挂机把磁盘写满。
 	usageLineCount atomic.Int64
+	// #20 热路径异步落盘：
+	//   keysDirty 由 ChargeKey 在改内存后打标，维护循环 FlushKeys 批量写盘（避免每请求
+	//   全量 saveKeysLocked）；keys/accounts 的写锁 s.mu 已覆盖 Keys 字段，故此处无需独立锁。
+	//   usageBuf/usageMu 收集待落盘的 usage 记录，FlushUsage 批量追加（一次 Open/Write 多行
+	//   一次 Close），用独立锁避免与 s.mu（keys/accounts/settings 读多写少）耦合。
+	keysDirty atomic.Bool
+	usageMu   sync.Mutex
+	usageBuf  []map[string]any
 }
 
 // NewStore 载入（或初始化）data 目录。
@@ -588,6 +721,10 @@ func normalizeSettings(v *Settings) {
 	}
 	if v.UsageRequestLogBytes <= 0 {
 		v.UsageRequestLogBytes = d.UsageRequestLogBytes
+	}
+	// 情景模式：旧配置缺该字段时归到 default（不改任何旋钮，仅记录名）。
+	if v.Scenario == "" {
+		v.Scenario = "default"
 	}
 }
 
@@ -1000,6 +1137,18 @@ func (s *Store) MutateKey(value string, fn func(*DownstreamKey) bool) bool {
 	return false
 }
 
+// FlushKeys 批量落盘下游密钥（#20：维护循环周期调用）。
+// 仅当 ChargeKey 在内存改过（keysDirty=true）才真正写一次盘，把「每请求全量
+// saveKeysLocked」降为「30s 一次」；与 FlushAccounts 的兜底写盘同口径。
+func (s *Store) FlushKeys() {
+	if !s.keysDirty.CompareAndSwap(true, false) {
+		return // 无脏数据
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_ = s.saveKeysLocked()
+}
+
 // KeysSnapshot 返回密钥列表深拷贝。
 func (s *Store) KeysSnapshot() []*DownstreamKey {
 	s.mu.RLock()
@@ -1048,6 +1197,8 @@ func (s *Store) QuotaExceeded(k *DownstreamKey) string {
 }
 
 // ChargeKey 记账（按天滚动）。tokens 为该次请求消耗的 token 总量（解析不到则为 0）。
+// #20：热路径不再同步全量落盘（原 saveKeysLocked 每请求一次 Open/Write/Close），
+// 改为内存累加 + 标 keysDirty，由维护循环 FlushKeys 周期批量写盘。
 func (s *Store) ChargeKey(value string, tokens int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1063,7 +1214,7 @@ func (s *Store) ChargeKey(value string, tokens int64) {
 			k.UsedToday++
 			k.UsedTokensTotal += tokens
 			k.UsedTokensToday += tokens
-			_ = s.saveKeysLocked()
+			s.keysDirty.Store(true)
 			return
 		}
 	}
@@ -1350,28 +1501,60 @@ func (s *Store) saveChatLogsLocked() error { return writeJSON(s.path("chat_logs.
 
 // ---- 用量日志 ----
 
-// AppendUsage 追加一行 JSONL（失败不影响主链路）。
-// P1-1：同时维护 usageLineCount，超过 UsageLogMaxLines 时滚动截断，
-// 防止 7×24 挂机把磁盘写满。
+// AppendUsage 记录一行 usage（#20：热路径不再每请求 Open/Write/Close）。
+// 改为入内存缓冲 usageBuf，由维护循环 FlushUsage 批量落盘（一次 Open/Write 多行
+// 一次 Close）。usageLineCount 仍按记录数原子自增，用于触发滚动截断。
 func (s *Store) AppendUsage(record map[string]any) {
-	buf, err := json.Marshal(record)
-	if err != nil {
+	if record == nil {
 		return
 	}
+	s.usageMu.Lock()
+	s.usageBuf = append(s.usageBuf, record)
+	s.usageMu.Unlock()
+
+	// 行数计数只作「是否该截断」的触发器，真正截断在 FlushUsage 批量落盘后
+	// 于磁盘态上执行（此处文件里还没有这批缓冲行，不能据此截断）。
+	s.usageLineCount.Add(1)
+}
+
+// FlushUsage 批量把 usageBuf 里的记录一次性追加到 usage.jsonl（#20：维护循环周期调用）。
+// 一次 Open/Write 多行 + 一次 Close，把「每请求一次磁盘往返」降为「30s 一次批量写」。
+// 与 429 不写盘同口径：挂机期间若进程被杀，最多丢最近一个 flush 周期（≤30s）的日志。
+func (s *Store) FlushUsage() {
+	s.usageMu.Lock()
+	if len(s.usageBuf) == 0 {
+		s.usageMu.Unlock()
+		return
+	}
+	batch := s.usageBuf
+	s.usageBuf = nil
+	s.usageMu.Unlock()
+
 	f, err := os.OpenFile(s.path("usage.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
+		// 写盘失败：记录放回缓冲头部，下轮重试（不丢数据）。
+		s.usageMu.Lock()
+		s.usageBuf = append(batch, s.usageBuf...)
+		s.usageMu.Unlock()
 		return
 	}
-	_, _ = f.Write(append(buf, '\n'))
+	var sb strings.Builder
+	for _, rec := range batch {
+		line, err := json.Marshal(rec)
+		if err != nil {
+			continue
+		}
+		sb.Write(line)
+		sb.WriteByte('\n')
+	}
+	if sb.Len() > 0 {
+		_, _ = f.WriteString(sb.String())
+	}
 	_ = f.Close()
 
-	n := s.usageLineCount.Add(1)
+	// 批量落盘完成后，基于磁盘态做一次截断（P1-1 滚动日志防磁盘写满）。
 	maxLines := s.Settings.UsageLogMaxLines
-	if maxLines <= 0 {
-		return
-	}
-	// 只在计数精确达到 maxLines 的整数倍时截断（避免每次追加都扫一遍文件）。
-	if n%int64(maxLines) == 0 {
+	if maxLines > 0 && s.usageLineCount.Load()%int64(maxLines) == 0 {
 		s.truncateUsageLog(maxLines)
 	}
 }

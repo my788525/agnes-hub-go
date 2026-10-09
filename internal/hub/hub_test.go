@@ -431,10 +431,10 @@ func TestAcquireRejectsWhenWaitExceedsLimit(t *testing.T) {
 	})
 	h.Reload()
 
-	if _, err := h.Acquire(context.Background(), a, "text"); err != nil {
+	if _, err := h.Acquire(context.Background(), a, "text", false); err != nil {
 		t.Fatalf("首次领槽应立刻成功：%v", err)
 	}
-	if _, err := h.Acquire(context.Background(), a, "text"); !errors.Is(err, ErrQueueTimeout) {
+	if _, err := h.Acquire(context.Background(), a, "text", false); !errors.Is(err, ErrQueueTimeout) {
 		t.Fatalf("预计等待 60s 远超上限 200ms，应返回 ErrQueueTimeout，实际 %v", err)
 	}
 	if h.Metrics.QueueTimeout.Load() == 0 {

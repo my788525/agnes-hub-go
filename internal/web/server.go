@@ -365,6 +365,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"last_success_age_ms": lastSuccessAgeMS,
 		"upstream_429_rate_per_min": s.Hub.Upstream429RatePerMin(),
 		"panics_total":       s.Hub.PanicsTotal(),
+		// #21 排队可观测：此刻发起一次文本请求，预计要排队等多久（取 text 池所有
+		// 启用账号 pacer 的最大投影等待）。探活脚本可据此预判「会不会堵」。
+		"text_projected_wait_ms": s.Hub.PoolMaxProjectedWaitMS("text"),
 	}, nil)
 }
 
@@ -682,7 +685,8 @@ func (s *Server) handleTextish(w http.ResponseWriter, r *http.Request, path stri
 		// Stream：客户端要流式时用「空闲看门狗」替代固定墙钟超时，长回答不断流。
 		Stream: wantsStream,
 	}
-	s.logUsage(item, decision, poolClass, r, path, wantsStream)
+	// #20：删除请求受理前的「accepted」双写——排队行为已由 done 记录的
+	// wait_ms / attempts / stream 完整反推，不再为此每请求多一次磁盘写。
 	s.proxy(w, r, item, opts, decision, wantsStream)
 }
 
@@ -1215,6 +1219,9 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 		headers["X-Agnes-Hub-Wait-Ms"] = strconv.FormatInt(result.WaitMS, 10)
 		headers["X-Agnes-Hub-Attempts"] = strconv.Itoa(result.Attempts)
 		if result.Status >= 400 {
+			if result.Status == http.StatusTooManyRequests {
+				s.ensure429RetryAfter(headers, opts.PoolClass) // #21：429 透传补 Retry-After
+			}
 			writeJSON(w, result.Status, decodeOrRaw(raw), headers)
 			return
 		}
@@ -1325,6 +1332,9 @@ func (s *Server) finishStream(w http.ResponseWriter, item *config.DownstreamKey,
 		for k, v := range decision.Headers() {
 			headers[k] = v
 		}
+		if result.Status == http.StatusTooManyRequests {
+			s.ensure429RetryAfter(headers, opts.PoolClass) // #21：429 透传补 Retry-After
+		}
 		writeJSON(w, result.Status, decodeOrRaw(raw), headers)
 		return
 	}
@@ -1400,16 +1410,6 @@ func (s *Server) writeSyntheticSSE(w http.ResponseWriter, envelope map[string]an
 // ---------------------------------------------------------------------------
 // 日志与错误
 // ---------------------------------------------------------------------------
-
-func (s *Server) logUsage(item *config.DownstreamKey, decision intent.Result, poolClass string,
-	r *http.Request, path string, stream bool) {
-	// 流式请求在拿到最终结果前先记一条「受理」记录，便于排障时看到排队行为
-	s.Store.AppendUsage(map[string]any{
-		"ts": time.Now().Format("2006-01-02 15:04:05"), "phase": "accepted",
-		"endpoint": path, "pool_class": poolClass, "intent": decision.Modality,
-		"intent_by": decision.Source, "key_name": item.Name, "stream": stream,
-	})
-}
 
 func (s *Server) logUsageFull(item *config.DownstreamKey, decision intent.Result, poolClass,
 	path string, stream bool, account *config.Account, waitMS int64, attempts int,
@@ -1546,6 +1546,24 @@ func passthroughHeaders(in http.Header) map[string]string {
 		}
 	}
 	return out
+}
+
+// ensure429RetryAfter #21：上游 429 透传时，若上游没带 Retry-After（免费号 agnes
+// 常见），按该池此刻的投影等待补一个兜底值，避免客户端「拿到 429 却不知等多久」。
+// 已有 Retry-After 则保留上游值（不覆盖）。
+func (s *Server) ensure429RetryAfter(headers map[string]string, poolClass string) {
+	if headers == nil || headers["Retry-After"] != "" {
+		return
+	}
+	ms := s.Hub.PoolMaxProjectedWaitMS(poolClass)
+	sec := int(ms/1000) + 1
+	if sec < 1 {
+		sec = 1
+	}
+	if sec > 60 {
+		sec = 60
+	}
+	headers["Retry-After"] = strconv.Itoa(sec)
 }
 
 func safeHeader(v string) string {

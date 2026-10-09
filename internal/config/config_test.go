@@ -382,6 +382,8 @@ func TestUsageLogAppendAndTail(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		s.AppendUsage(map[string]any{"i": i})
 	}
+	// #20：AppendUsage 改为内存缓冲，需 FlushUsage 批量落盘后 TailUsage 才可见。
+	s.FlushUsage()
 	got := s.TailUsage(3)
 	if len(got) != 3 {
 		t.Fatalf("应取回最近 3 条，实际 %d", len(got))

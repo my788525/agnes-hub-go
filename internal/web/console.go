@@ -88,6 +88,7 @@ func (s *Server) consoleRoutes() {
 
 	m.HandleFunc("GET /api/settings", s.apiGetSettings)
 	m.HandleFunc("POST /api/settings", s.apiSetSettings)
+	m.HandleFunc("GET /api/scenarios", s.apiListScenarios)
 	m.HandleFunc("GET /api/export", s.apiExport)
 	m.HandleFunc("POST /api/import", s.apiImport)
 
@@ -1070,6 +1071,18 @@ func randHex(n int) string {
 // 设置
 // ---------------------------------------------------------------------------
 
+// apiListScenarios 返回全部情景参数包（供控制台「运行情景」卡片渲染）。
+func (s *Server) apiListScenarios(w http.ResponseWriter, r *http.Request) {
+	if !s.authed(r) {
+		s.deny(w)
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"current": s.Store.SettingsSnapshot().Scenario,
+		"scenarios": config.ScenarioPresets(),
+	}, nil)
+}
+
 func (s *Server) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
 		s.deny(w)
@@ -1123,6 +1136,11 @@ func (s *Server) apiSetSettings(w http.ResponseWriter, r *http.Request) {
 // applySettings 把控制台提交的字段写入设置（只认白名单，忽略未知键）。
 // 注意：此函数在 UpdateSettings 锁内调用，不能访问 s。
 func applySettings(st *config.Settings, p map[string]any) {
+	// 情景模式打底：先按 scenario 覆写整套旋钮，随后下方单项白名单再逐个覆盖
+	// （实现「一键应用情景 + 单项可改回」）。未知情景 ApplyScenario 返回 false、不改字段。
+	if n := strings.TrimSpace(asStr(p["scenario"])); n != "" {
+		_ = config.ApplyScenario(st, n)
+	}
 	f := func(key string, dst *float64) {
 		if v, ok := p[key]; ok {
 			*dst = parseFloat(asStr(v))
@@ -1177,6 +1195,10 @@ func applySettings(st *config.Settings, p map[string]any) {
 	i("log_retention_days", &st.LogRetentionDays)
 	f("session_ttl_hours", &st.SessionTTLHours)
 	s2("probe_model", &st.ProbeModel)
+	// 两级队列单项开关（不随情景改也能独立打开/关闭）
+	if v, ok := p["text_two_level_queue"]; ok {
+		st.TextTwoLevelQueue = truthy(v)
+	}
 
 	if v, ok := p["model_aliases"].(map[string]any); ok {
 		next := map[string]string{}

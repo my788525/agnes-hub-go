@@ -252,7 +252,7 @@ func Do(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) (*Re
 		}
 		account := picked.Account
 
-		wait, err := h.Acquire(ctx, account, opts.PoolClass)
+		wait, err := h.Acquire(ctx, account, opts.PoolClass, opts.Stream) // #22：流式=低优先级让位非流式
 		if err != nil {
 			return nil, err
 		}

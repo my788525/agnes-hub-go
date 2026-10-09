@@ -85,6 +85,12 @@ type Hub struct {
 	// 供 /healthz 的 upstream_429_rate_per_min（「最近一分钟到底有多少次限流」）。
 	Recent429 rate429Ring
 
+	// #22 两级队列：highWaiting 统计「某账号 × 某池」当前处于 Reserve 领槽区间的
+	// 非流式（高优先级）请求数。流式（低优先级）在领槽前会限时等它清零，从而让
+	// 短促的工具调用（非流式）在文本池里优先于长回答（流式）拿到节拍槽位。
+	// 只用 h.mu 保护（短临界区，不嵌套），与 Pacer() 共享同一把锁互斥安全。
+	highWaiting map[string]int
+
 	// Metrics 是运行指标（/healthz 与控制台观测）。
 	Metrics Metrics
 }
@@ -209,6 +215,7 @@ func New(store *config.Store) *Hub {
 		successes:     map[string]int{},
 		reviveAt:      map[string]time.Time{},
 		pendingFactor: map[string]bool{},
+		highWaiting:   map[string]int{}, // #22 两级队列：非流式领槽区间计数
 	}
 	h.Metrics.StartedAt = time.Now()
 	h.Reload()
@@ -562,6 +569,10 @@ func (h *Hub) flushFactors() {
 	// 兜底：把统计字段（RateLimited / LastError / 熔断状态等）批量写一次，
 	// 热路径里改这些字段的代码一律走 MutateAccountNoSave，这里统一落盘。
 	h.store.FlushAccounts()
+	// #20 热路径异步落盘：批量写下游密钥（ChargeKey 只改内存）+ 批量追加 usage 日志
+	// （AppendUsage 只入内存缓冲）。与 429 不写盘同口径，挂机丢 ≤30s 可接受。
+	h.store.FlushKeys()
+	h.store.FlushUsage()
 }
 
 // BindFactor 立即把某个 (账号 × 池) 因子落盘（控制台重置时用）。
@@ -870,6 +881,22 @@ func (h *Hub) Upstream429RatePerMin() int {
 	return h.Recent429.PerMinute()
 }
 
+// PoolMaxProjectedWaitMS 取某池所有「启用」账号 pacer 的最大投影等待（毫秒）。
+// #21：供 /healthz 的 text_projected_wait_ms（排队可观测）与上游 429 兜底
+// Retry-After（按池深度算，而非写死 5s）复用。无启用账号或该池无流量则返回 0。
+func (h *Hub) PoolMaxProjectedWaitMS(poolClass string) int64 {
+	max := int64(0)
+	for _, a := range h.store.AccountsSnapshot() {
+		if !a.Enabled {
+			continue
+		}
+		if w := h.Pacer(a, poolClass).ProjectedWait().Milliseconds(); w > max {
+			max = w
+		}
+	}
+	return max
+}
+
 // PanicsTotal 已被 recover 兜住的 panic 次数。
 func (h *Hub) PanicsTotal() int64 {
 	return h.Metrics.PanicsTotal.Load()
@@ -880,7 +907,12 @@ func (h *Hub) PanicsTotal() int64 {
 // ---------------------------------------------------------------------------
 
 // Acquire 等待并领取一个发送槽位，返回排队等待时长。
-func (h *Hub) Acquire(ctx context.Context, a *config.Account, poolClass string) (time.Duration, error) {
+//
+// lowPriority：#22 两级队列。文本池内「非流式（工具/短调用）= 高优先级、流式（长生成）
+// = 低优先级」。开启 TextTwoLevelQueue 且池为 text 时，流式请求（lowPriority=true）在
+// 领槽前会限时等本账号非流式请求的领槽区间（highWaiting）清零，让短促调用优先拿到
+// 节拍槽位；领到的仍是下一个空闲槽（绝不超车已领槽位），RPM 安全节拍不变。
+func (h *Hub) Acquire(ctx context.Context, a *config.Account, poolClass string, lowPriority bool) (time.Duration, error) {
 	s := h.Settings()
 	maxWait := time.Duration(s.QueueMaxWaitMS) * time.Millisecond
 	limitMS := s.QueueMaxWaitMS
@@ -892,6 +924,45 @@ func (h *Hub) Acquire(ctx context.Context, a *config.Account, poolClass string) 
 		case <-ctx.Done():
 			return time.Since(started), ctx.Err()
 		}
+	}
+	// #22 两级队列：仅文本池 + 开启开关 + 本请求为低优先级（流式）时，先限时让位。
+	// 轮询 highWaiting[k]==0（尊重 ctx 与剩余预算），避免高优先级（非流式）还在领槽时
+	// 流式请求插队抢占节拍。等待本身计入总排队时长。
+	if lowPriority && s.TextTwoLevelQueue && poolClass == "text" {
+		k := key(a.ID, poolClass)
+		highWaitingClear := func() bool {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			return h.highWaiting[k] == 0
+		}
+		if !highWaitingClear() {
+			deadline := started.Add(maxWait)
+			for !highWaitingClear() {
+				remain := time.Until(deadline)
+				if remain <= 0 {
+					break // 预算耗尽，不再让位（继续按剩余 0 预算领槽，由 Reserve 判定）
+				}
+				select {
+				case <-time.After(min(remain, 50*time.Millisecond)):
+				case <-ctx.Done():
+					return time.Since(started), ctx.Err()
+				}
+			}
+		}
+	}
+	// 高优先级（非流式）在领槽区间内标记 highWaiting，让后到的低优先级让位。
+	k := key(a.ID, poolClass)
+	if !lowPriority {
+		h.mu.Lock()
+		h.highWaiting[k]++
+		h.mu.Unlock()
+		defer func() {
+			h.mu.Lock()
+			if h.highWaiting[k] > 0 {
+				h.highWaiting[k]--
+			}
+			h.mu.Unlock()
+		}()
 	}
 	waited, err := h.Pacer(a, poolClass).Reserve(ctx, maxWait-time.Since(started), s.QueueMaxSize)
 	if err != nil {
