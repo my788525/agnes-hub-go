@@ -529,6 +529,10 @@ type Store struct {
 	keysDirty atomic.Bool
 	usageMu   sync.Mutex
 	usageBuf  []map[string]any
+	// #20 补漏：bindingsDirty 由热路径 Bind（Pick 每个粘性会话请求都会调）打标，
+	// 维护循环 FlushBindings 批量写盘，避免每请求同步 saveBindingsLocked。
+	// 与 keysDirty 一样走 s.mu 保护（s.Bindings 在 s.mu 下），无需独立锁。
+	bindingsDirty atomic.Bool
 }
 
 // NewStore 载入（或初始化）data 目录。
@@ -1223,6 +1227,8 @@ func (s *Store) ChargeKey(value string, tokens int64) {
 // ---- 粘性绑定 ----
 
 // Bind 写入绑定。
+// #20 补漏：热路径（Pick 每个粘性会话请求都会调）不再同步 saveBindingsLocked，
+// 改为内存写 + 标 bindingsDirty，由维护循环 FlushBindings 30s 批量落盘。
 func (s *Store) Bind(sessionKey, accountID string) {
 	if sessionKey == "" {
 		return
@@ -1234,6 +1240,17 @@ func (s *Store) Bind(sessionKey, accountID string) {
 	}
 	s.Bindings[sessionKey] = Binding{AccountID: accountID, Updated: float64(time.Now().UnixNano()) / 1e9}
 	s.gcBindingsLocked()
+	s.bindingsDirty.Store(true)
+}
+
+// FlushBindings 批量落盘粘性绑定（#20 补漏：维护循环周期调用）。
+// 仅当热路径 Bind 改过（bindingsDirty=true）才真正写一次盘；与 FlushKeys 同口径。
+func (s *Store) FlushBindings() {
+	if !s.bindingsDirty.CompareAndSwap(true, false) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_ = s.saveBindingsLocked()
 }
 
@@ -1591,7 +1608,7 @@ func countLines(path string) int64 {
 	return int64(strings.Count(string(data), "\n"))
 }
 
-// TailUsage 读取最近 n 条日志（倒序）。
+// TailUsage 读取最近 n 条日志（倒序，只读磁盘）。
 func (s *Store) TailUsage(n int) []map[string]any {
 	buf, err := os.ReadFile(s.path("usage.jsonl"))
 	if err != nil {
@@ -1611,6 +1628,38 @@ func (s *Store) TailUsage(n int) []map[string]any {
 		if json.Unmarshal([]byte(line), &rec) == nil {
 			out = append(out, rec)
 		}
+	}
+	return out
+}
+
+// TailUsageLive 控制台日志页专用（#20 修复）：把「尚未落盘的内存缓冲」也算进最近
+// 记录，避免异步批量落盘后，刚发完请求的 user_request（用户输入）要等 30s 才在
+// 日志页可见。pending 里的记录尚未上盘，与磁盘内容不重叠；结果倒序（最新在前），
+// 取最近 n 条。
+func (s *Store) TailUsageLive(n int) []map[string]any {
+	if n <= 0 {
+		n = 200
+	}
+	// 1) 内存未落盘缓冲（append 顺序：旧→新）
+	s.usageMu.Lock()
+	pending := make([]map[string]any, len(s.usageBuf))
+	copy(pending, s.usageBuf)
+	pendingCount := len(pending)
+	s.usageMu.Unlock()
+
+	// 2) 磁盘尾部：多读 pending 的份数，保证合并后仍有 n 条可选
+	disk := s.TailUsage(n + pendingCount)
+
+	out := make([]map[string]any, 0, n)
+	// pending 倒序遍历即「新→旧」，先取它（比磁盘里更近）
+	for i := pendingCount - 1; i >= 0 && len(out) < n; i-- {
+		out = append(out, pending[i])
+	}
+	for _, rec := range disk {
+		if len(out) >= n {
+			break
+		}
+		out = append(out, rec)
 	}
 	return out
 }

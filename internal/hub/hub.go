@@ -570,9 +570,10 @@ func (h *Hub) flushFactors() {
 	// 热路径里改这些字段的代码一律走 MutateAccountNoSave，这里统一落盘。
 	h.store.FlushAccounts()
 	// #20 热路径异步落盘：批量写下游密钥（ChargeKey 只改内存）+ 批量追加 usage 日志
-	// （AppendUsage 只入内存缓冲）。与 429 不写盘同口径，挂机丢 ≤30s 可接受。
+	// （AppendUsage 只入内存缓冲）+ 批量写粘性绑定（Bind 只改内存）。挂机丢 ≤30s 可接受。
 	h.store.FlushKeys()
 	h.store.FlushUsage()
+	h.store.FlushBindings()
 }
 
 // BindFactor 立即把某个 (账号 × 池) 因子落盘（控制台重置时用）。
@@ -616,7 +617,10 @@ func (h *Hub) SessionKey(headers map[string]string, downstreamKey string) string
 	if mode == "none" {
 		return ""
 	}
-	session := strings.TrimSpace(headers["x-baipiao-session"])
+	session := strings.TrimSpace(headers["x-agnes-session"])
+	if session == "" {
+		session = strings.TrimSpace(headers["x-baipiao-session"]) // 旧品牌头，兼容老客户端
+	}
 	if session == "" {
 		session = strings.TrimSpace(headers["x-session-id"])
 	}

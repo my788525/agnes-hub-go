@@ -887,7 +887,9 @@ func (s *Server) apiLogs(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 {
 		limit = 200
 	}
-	writeJSON(w, 200, map[string]any{"logs": s.Store.TailUsage(limit)}, nil)
+	// #20 修复：走 TailUsageLive，把尚未批量落盘（30s 周期）的内存缓冲也计入，
+	// 否则刚发完请求的 user_request（用户输入）在日志页会延迟 30s 才可见。
+	writeJSON(w, 200, map[string]any{"logs": s.Store.TailUsageLive(limit)}, nil)
 }
 
 func (s *Server) apiBindings(w http.ResponseWriter, r *http.Request) {

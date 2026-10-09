@@ -394,6 +394,33 @@ func TestUsageLogAppendAndTail(t *testing.T) {
 	}
 }
 
+// TestUsageLogLiveIncludesUnflushed #20 修复回归：TailUsageLive 必须能把
+// 尚未 FlushUsage 落盘的内存缓冲也计入（控制台日志页实时可见 user_request），
+// 且新记录排在最新（倒序首条应为 i=4）。
+func TestUsageLogLiveIncludesUnflushed(t *testing.T) {
+	s := newTestStore(t)
+	// 先落盘 3 条作为磁盘基线
+	for i := 0; i < 3; i++ {
+		s.AppendUsage(map[string]any{"i": float64(i), "src": "disk"})
+	}
+	s.FlushUsage()
+	// 再 2 条只进内存缓冲，不 Flush
+	for i := 3; i < 5; i++ {
+		s.AppendUsage(map[string]any{"i": float64(i), "src": "pending"})
+	}
+	got := s.TailUsageLive(10)
+	if len(got) != 5 {
+		t.Fatalf("Live 应合并 3 磁盘 + 2 内存 = 5 条，实际 %d", len(got))
+	}
+	// 倒序：最新的（内存 i=4）在最前
+	if v, _ := got[0]["i"].(float64); v != 4 {
+		t.Errorf("Live 首条应为最新 i=4，实际 %v", got[0]["i"])
+	}
+	if got[0]["src"] != "pending" {
+		t.Errorf("Live 首条应来自未落盘缓冲，实际 %v", got[0]["src"])
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 鉴权
 // ---------------------------------------------------------------------------
