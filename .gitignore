@@ -1,14 +1,17 @@
 # 编译产物（由 go build 交叉编译生成，只走 GitHub Release，不入库）
-*.exe~        # Go 链接器覆盖运行中的 exe 时留下的备份
+# Go 链接器覆盖运行中的 exe 时留下的备份
+*.exe~
 *.exe
 agnes-hub-go
 agnes-hub-go-linux-amd64
 agnes-hub-go-linux-arm64
-agnes-hub-go-linux-amd64-*   # 版本化发布副本（上传 Release 后即冗余）
+# 版本化发布副本（上传 GitHub Release 后即冗余，不入库）
+agnes-hub-go-linux-amd64-*
 agnes-hub-go-linux-arm64-*
 baipiao-hub-linux-amd64
 baipiao-hub-linux-arm64
-release_*.py   # 一次性发布脚本（内含 GitHub PAT，绝不入库）
+# 一次性发布脚本（内含 GitHub PAT，绝不入库）
+release_*.py
 
 # 运行期数据：含上游 API Key 与管理员口令散列，绝不提交
 data/

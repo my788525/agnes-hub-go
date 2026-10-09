@@ -526,7 +526,7 @@ func (s *Server) handleTextish(w http.ResponseWriter, r *http.Request, path stri
 		writeErr(w, e)
 		return
 	}
-	body, _, e := readBody(r)
+	body, rawBody, e := readBody(r)
 	if e != nil {
 		writeErr(w, e)
 		return
@@ -599,6 +599,9 @@ func (s *Server) handleTextish(w http.ResponseWriter, r *http.Request, path stri
 		RequiredModel: requiredModel, Method: http.MethodPost, Path: path,
 		BodyFor: bodyFor, Anthropic: path == "/v1/messages",
 		Idempotent: true, // 文本对话可安全重试
+		// Body 仅用于日志「用户提出的完整请求」展示；实际转发由 BodyFor 生成
+		// （relay.Do 中 BodyFor 非 nil 时优先），故此处填原始请求体不影响请求本身。
+		Body: rawBody,
 	}
 	s.logUsage(item, decision, poolClass, r, path, wantsStream)
 	s.proxy(w, r, item, opts, decision, wantsStream)
