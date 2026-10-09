@@ -1208,14 +1208,17 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 	if !wantsStream {
 		result, err := relay.Do(ctx, s.Hub, s.Client, opts)
 		if err != nil {
+			s.logUsageError(item, decision, opts.PoolClass, opts.Path, false, nil, 0, 0, decision.Prompt.Text, 502, err.Error())
 			writeErr(w, relayError(err))
 			return
 		}
 		raw := result.ReadAll()
 		if result.Status < 400 {
 			s.Store.ChargeKey(item.Key, extractUsage(raw))
+			s.logUsageFull(item, decision, opts.PoolClass, opts.Path, false, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text)
+		} else {
+			s.logUsageError(item, decision, opts.PoolClass, opts.Path, false, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text, result.Status, string(raw))
 		}
-		s.logUsageFull(item, decision, opts.PoolClass, opts.Path, false, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text)
 		headers := passthroughHeaders(result.Header)
 		for k, v := range decision.Headers() {
 			headers[k] = v
@@ -1295,6 +1298,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 		select {
 		case out := <-ch:
 			if out.err != nil {
+				s.logUsageError(item, decision, opts.PoolClass, opts.Path, true, nil, 0, 0, decision.Prompt.Text, 502, out.err.Error())
 				writeSSEFrame(w, flusher, map[string]any{
 					"error": map[string]any{"message": out.err.Error(), "type": "baipiao_hub_queue"}})
 				return
@@ -1308,7 +1312,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 						"message": string(raw), "type": "upstream_error"}}
 				}
 			writeSSEFrame(w, flusher, payload)
-			s.logUsageFull(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text)
+			s.logUsageError(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text, result.Status, string(raw))
 			return
 		}
 		writeSSEComment(w, flusher, fmt.Sprintf("baiPiao-hub account=%s wait_ms=%d attempts=%d model=%s",
@@ -1332,11 +1336,13 @@ func (s *Server) finishStream(w http.ResponseWriter, item *config.DownstreamKey,
 	err error, decision intent.Result, opts relay.Options, streamMode bool) {
 
 	if err != nil {
+		s.logUsageError(item, decision, opts.PoolClass, opts.Path, streamMode, nil, 0, 0, decision.Prompt.Text, 502, err.Error())
 		writeErr(w, relayError(err))
 		return
 	}
 	if result.Status >= 400 {
 		raw := result.ReadAll()
+		s.logUsageError(item, decision, opts.PoolClass, opts.Path, streamMode, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text, result.Status, string(raw))
 		headers := passthroughHeaders(result.Header)
 		for k, v := range decision.Headers() {
 			headers[k] = v
@@ -1418,6 +1424,31 @@ func (s *Server) writeSyntheticSSE(w http.ResponseWriter, envelope map[string]an
 
 // ---------------------------------------------------------------------------
 // 日志与错误
+// ---------------------------------------------------------------------------
+
+// logUsageError 把失败请求（上游 4xx/5xx、relay 内部错误）也记入 usage.jsonl（phase=error）。
+// 此前只记成功请求，「502 上游连接失败」类问题在网关侧完全无痕，事后无法排查。
+func (s *Server) logUsageError(item *config.DownstreamKey, decision intent.Result, poolClass,
+	path string, stream bool, account *config.Account, waitMS int64, attempts int,
+	userRequest string, status int, errMsg string) {
+	acctName, acctID := "", ""
+	if account != nil {
+		acctName, acctID = account.Name, account.ID
+	}
+	ur := requestLog(intent.CleanUserMessage(userRequest), s.Store.SettingsSnapshot().UsageRequestLogBytes)
+	s.Store.AppendUsage(map[string]any{
+		"ts": time.Now().Format("2006-01-02 15:04:05"), "phase": "error",
+		"status": status, "error": requestLog(errMsg, 400),
+		"endpoint": path, "pool_class": poolClass,
+		"intent": decision.Modality, "intent_by": decision.Source,
+		"intent_score": decision.Score, "intent_reason": decision.Reason,
+		"model_requested": decision.ModelRequested, "model_used": decision.ModelUsed,
+		"key_name": item.Name, "account": acctName, "account_id": acctID,
+		"wait_ms": waitMS, "attempts": attempts, "stream": stream,
+		"user_request": ur,
+	})
+}
+
 // ---------------------------------------------------------------------------
 
 func (s *Server) logUsageFull(item *config.DownstreamKey, decision intent.Result, poolClass,

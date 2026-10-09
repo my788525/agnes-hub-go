@@ -318,6 +318,10 @@ exit 0
 TRIVIAL = "#!/bin/bash\nexit 0\n"
 
 CHANGELOG = (
+    "1.0.23→1.0.24：失败请求可观测性——usage.jsonl 新增 phase=error 记录。"
+    "此前只记成功请求，「502 上游连接失败」类故障在网关侧完全无痕；现于全部失败路径"
+    "（非流式/流式 4xx5xx、relay 内部错误、流式心跳路径）落错误日志（含 status、错误摘要、"
+    "命中账号、attempts），流式失败处原误记 phase=done 亦修正为 error。"
     "1.0.22→1.0.23：按用户要求彻底移除「上游上下文策略（系统提示词）」模式（forward/strip/override/scenario）——"
     "后台控制台不再提供该模式选择卡片，网关对 WorkBuddy 提交的内容一律原样转发（不再改写/剥离 system）；"
     "同时把 #29 的效率优化定为默认开启：发往上游的请求体默认 gzip 压缩（upstream_request_gzip 默认 true，"
