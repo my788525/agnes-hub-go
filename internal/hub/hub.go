@@ -264,7 +264,7 @@ func (h *Hub) learnedFactorOf(a *config.Account) float64 {
 }
 
 func (h *Hub) effectiveRPMLocked(a *config.Account, poolClass string, s config.Settings) float64 {
-	base := baseRPM(a, poolClass)
+	base := baseRPM(a, poolClass, s.FreeTextRPM)
 	factor := h.poolFactors[key(a.ID, poolClass)]
 	if factor <= 0 {
 		factor = 1
@@ -276,9 +276,13 @@ func (h *Hub) effectiveRPMLocked(a *config.Account, poolClass string, s config.S
 	return math.Max(0.01, base*safety*h.learnedFactorOf(a)*factor)
 }
 
-func baseRPM(a *config.Account, poolClass string) float64 {
+func baseRPM(a *config.Account, poolClass string, freeTextRPM float64) float64 {
 	if v, ok := a.RPMOverrides[poolClass]; ok && v > 0 {
 		return v
+	}
+	// agnes 免费档文本池的 RPM 改为可配置项（FreeTextRPM）；0 表示用档位表。
+	if a.AccessType == "free" && poolClass == "text" && freeTextRPM > 0 {
+		return freeTextRPM
 	}
 	table, ok := config.RPMTable[a.AccessType]
 	if !ok {

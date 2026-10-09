@@ -29,7 +29,7 @@ import (
 // ---------------------------------------------------------------------------
 var RPMTable = map[string]map[string]float64{
 	"free": {
-		"text": 20, "image_1k": 20, "image_2k": 10, "image_3k": 1, "image_4k": 1, "video": 1,
+		"text": 10, "image_1k": 20, "image_2k": 10, "image_3k": 1, "image_4k": 1, "video": 1,
 	},
 	"enterprise": {
 		"text": 40, "image_1k": 40, "image_2k": 20, "image_3k": 1, "image_4k": 1, "video": 2,
@@ -190,6 +190,9 @@ type DownstreamKey struct {
 	PinnedAccount string   `json:"pinned_account,omitempty"`
 	UsedTotal     int64    `json:"used_total"`
 	UsedToday     int64    `json:"used_today"`
+	// 令牌（token）用量统计：UsedTokensToday 按天滚动，UsedTokensTotal 累计。
+	UsedTokensTotal int64  `json:"used_tokens_total"`
+	UsedTokensToday int64  `json:"used_tokens_today"`
 	UsedDate      string   `json:"used_date"`
 	CreatedAt     float64  `json:"created_at"`
 }
@@ -293,6 +296,9 @@ type Settings struct {
 	ImageMaxCapacity     int                `json:"image_max_capacity"`
 	VideoMaxCapacity     int                `json:"video_max_capacity"`
 	RequestTimeoutMS     int                `json:"request_timeout_ms"` // 单个上游请求超时（ms），0=无限（不推荐）
+	// FreeTextRPM 是 agnes 免费档（access_type=free）文本池的标称 RPM，改为可配置项。
+	// 默认 10；填 0 或留空则回退默认值。per-account 的 rpm_overrides 仍然优先。
+	FreeTextRPM          float64            `json:"free_text_rpm"`
 	ChatPasswordHash     string             `json:"chat_password_hash,omitempty"`
 	ChatPasswordSalt     string             `json:"chat_password_salt,omitempty"`
 }
@@ -352,6 +358,7 @@ func DefaultSettings() Settings {
 		VideoMaxCapacity:    200,
 		RegionPriority:      "cn_first",
 		RequestTimeoutMS:    30000, // 默认 30s 上游请求超时
+		FreeTextRPM:         10,    // agnes 免费档文本池标称 RPM（可配置）
 	}
 }
 
@@ -545,6 +552,9 @@ func normalizeSettings(v *Settings) {
 	}
 	if v.VideoMaxCapacity <= 0 {
 		v.VideoMaxCapacity = d.VideoMaxCapacity
+	}
+	if v.FreeTextRPM <= 0 {
+		v.FreeTextRPM = d.FreeTextRPM
 	}
 }
 
@@ -870,12 +880,16 @@ func (s *Store) DeleteAccount(id string) bool {
 func (s *Store) RPMFor(a *Account, poolClass string) float64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return rpmFor(a, poolClass)
+	return rpmFor(a, poolClass, s.Settings.FreeTextRPM)
 }
 
-func rpmFor(a *Account, poolClass string) float64 {
+func rpmFor(a *Account, poolClass string, freeTextRPM float64) float64 {
 	if v, ok := a.RPMOverrides[poolClass]; ok && v > 0 {
 		return v
+	}
+	// agnes 免费档文本池的 RPM 改为可配置项（FreeTextRPM）；0 表示用档位表。
+	if a.AccessType == "free" && poolClass == "text" && freeTextRPM > 0 {
+		return freeTextRPM
 	}
 	table, ok := RPMTable[a.AccessType]
 	if !ok {
@@ -1000,8 +1014,8 @@ func (s *Store) QuotaExceeded(k *DownstreamKey) string {
 	return ""
 }
 
-// ChargeKey 记账（按天滚动）。
-func (s *Store) ChargeKey(value string) {
+// ChargeKey 记账（按天滚动）。tokens 为该次请求消耗的 token 总量（解析不到则为 0）。
+func (s *Store) ChargeKey(value string, tokens int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	today := time.Now().Format("2006-01-02")
@@ -1010,9 +1024,12 @@ func (s *Store) ChargeKey(value string) {
 			if k.UsedDate != today {
 				k.UsedDate = today
 				k.UsedToday = 0
+				k.UsedTokensToday = 0
 			}
 			k.UsedTotal++
 			k.UsedToday++
+			k.UsedTokensTotal += tokens
+			k.UsedTokensToday += tokens
 			_ = s.saveKeysLocked()
 			return
 		}

@@ -146,12 +146,19 @@ func TestRPMForOverrideBeatsTierTable(t *testing.T) {
 	s := newTestStore(t)
 	a := s.AddAccount("账号", "sk-1", "free", "", nil)
 
-	if got := s.RPMFor(a, "text"); got != 20 {
-		t.Fatalf("free 档文本池基线应为 20，实际 %v", got)
+	// 默认：agnes 免费档文本池基线由可配置项 FreeTextRPM 决定（默认 10）
+	if got := s.RPMFor(a, "text"); got != 10 {
+		t.Fatalf("free 档文本池基线应为 10，实际 %v", got)
 	}
 	if got := s.RPMFor(a, "video"); got != 1 {
 		t.Fatalf("free 档视频池基线应为 1，实际 %v", got)
 	}
+	// 全局可配置项优先生效
+	s.UpdateSettings(func(st *Settings) { st.FreeTextRPM = 15 })
+	if got := s.RPMFor(a, "text"); got != 15 {
+		t.Fatalf("FreeTextRPM 应优先生效，实际 %v", got)
+	}
+	// 账号级覆盖仍优先于全局可配置项
 	a.RPMOverrides["text"] = 22
 	if got := s.RPMFor(a, "text"); got != 22 {
 		t.Fatalf("账号级覆盖应优先，实际 %v", got)
@@ -277,8 +284,8 @@ func TestKeyLifecycleQuotaAndCharge(t *testing.T) {
 	if reason := s.QuotaExceeded(k); reason != "" {
 		t.Fatalf("尚未使用不应超限，实际 %q", reason)
 	}
-	s.ChargeKey(k.Key)
-	s.ChargeKey(k.Key)
+	s.ChargeKey(k.Key, 0)
+	s.ChargeKey(k.Key, 0)
 	if reason := s.QuotaExceeded(k); reason == "" {
 		t.Fatal("已达每日额度上限应报超限")
 	}
@@ -296,7 +303,7 @@ func TestKeyLifecycleQuotaAndCharge(t *testing.T) {
 func TestTotalQuotaIsEnforced(t *testing.T) {
 	s := newTestStore(t)
 	k := s.AddKey("总额度密钥", nil, 0, 1, "")
-	s.ChargeKey(k.Key)
+	s.ChargeKey(k.Key, 0)
 	if reason := s.QuotaExceeded(s.KeyByValue(k.Key)); reason == "" {
 		t.Fatal("已达总额度上限应报超限")
 	}

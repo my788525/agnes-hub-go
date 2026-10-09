@@ -271,8 +271,8 @@ func TestCalibrationIsPerPoolNotPerAccount(t *testing.T) {
 
 	beforeText := h.EffectiveRPM(a, "text")
 	beforeVideo := h.EffectiveRPM(a, "video")
-	if math.Abs(beforeText-20) > 1e-9 {
-		t.Fatalf("free 档文本池基线应为 20 RPM，实际 %.3f", beforeText)
+	if math.Abs(beforeText-10) > 1e-9 {
+		t.Fatalf("free 档文本池基线应为 10 RPM，实际 %.3f", beforeText)
 	}
 	if math.Abs(beforeVideo-1) > 1e-9 {
 		t.Fatalf("free 档视频池基线应为 1 RPM，实际 %.3f", beforeVideo)
@@ -479,12 +479,12 @@ func TestEffectiveRPMAppliesSafetyAndFactor(t *testing.T) {
 	a := store.AddAccount("账号", "sk-a", "free", "", nil)
 	h.Reload()
 
-	if got := h.EffectiveRPM(a, "text"); math.Abs(got-20) > 1e-9 {
-		t.Fatalf("free 档文本池 baseline×安全系数(1.0) 应为 20，实际 %.3f", got)
+	if got := h.EffectiveRPM(a, "text"); math.Abs(got-10) > 1e-9 {
+		t.Fatalf("free 档文本池 baseline×安全系数(1.0) 应为 10，实际 %.3f", got)
 	}
 	h.BindFactor(a.ID, "text", 0.5)
-	if got := h.EffectiveRPM(a, "text"); math.Abs(got-10) > 1e-9 {
-		t.Fatalf("池因子 0.5 应使有效 RPM 降到 10，实际 %.3f", got)
+	if got := h.EffectiveRPM(a, "text"); math.Abs(got-5) > 1e-9 {
+		t.Fatalf("池因子 0.5 应使有效 RPM 降到 5，实际 %.3f", got)
 	}
 }
 

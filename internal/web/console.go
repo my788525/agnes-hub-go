@@ -1172,6 +1172,7 @@ func applySettings(st *config.Settings, p map[string]any) {
 	i("breaker_revive_sec", &st.BreakerReviveSec)
 	s2("video_poll_path", &st.VideoPollPath)
 	b("video_poll_include_model_name", &st.VideoPollWithModel)
+	f("free_text_rpm", &st.FreeTextRPM)
 	i("video_poll_interval_ms", &st.VideoPollIntervalMS)
 	i("log_retention_days", &st.LogRetentionDays)
 	f("session_ttl_hours", &st.SessionTTLHours)

@@ -733,8 +733,8 @@ func (s *Server) serveAutoImage(w http.ResponseWriter, r *http.Request, item *co
 	}
 	raw := result.ReadAll()
 	decision.ModelUsed = result.ModelUsed
-	s.Store.ChargeKey(item.Key)
-	s.logUsageFull(item, decision, poolClass, "/v1/images/generations", chatShape, result.Account, result.WaitMS, result.Attempts)
+	s.Store.ChargeKey(item.Key, extractUsage(raw))
+	s.logUsageFull(item, decision, poolClass, "/v1/images/generations", chatShape, result.Account, result.WaitMS, result.Attempts, mustJSON(body))
 
 	// 记录图片生成结果（便于控制台查看历史）
 	requestID := config.NewID("img")
@@ -846,7 +846,7 @@ func (s *Server) serveAutoVideo(w http.ResponseWriter, r *http.Request, item *co
 	}
 	raw := result.ReadAll()
 	decision.ModelUsed = result.ModelUsed
-	s.logUsageFull(item, decision, poolClass, "/v1/videos", chatShape, result.Account, result.WaitMS, result.Attempts)
+	s.logUsageFull(item, decision, poolClass, "/v1/videos", chatShape, result.Account, result.WaitMS, result.Attempts, mustJSON(body))
 
 	extra := decision.Headers()
 	extra["X-Agnes-Hub-Account"] = safeHeader(result.Account.Name)
@@ -869,7 +869,7 @@ func (s *Server) serveAutoVideo(w http.ResponseWriter, r *http.Request, item *co
 		CreatedAt: float64(time.Now().UnixNano()) / 1e9,
 	}
 	s.Store.PutJob(job)
-	s.Store.ChargeKey(item.Key)
+	s.Store.ChargeKey(item.Key, extractUsage(raw))
 	extra["X-Agnes-Hub-Job-Id"] = job.JobID
 
 	jobInfo := map[string]any{
@@ -1109,9 +1109,9 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 		}
 		raw := result.ReadAll()
 		if result.Status < 400 {
-			s.Store.ChargeKey(item.Key)
+			s.Store.ChargeKey(item.Key, extractUsage(raw))
 		}
-		s.logUsageFull(item, decision, opts.PoolClass, opts.Path, false, result.Account, result.WaitMS, result.Attempts)
+		s.logUsageFull(item, decision, opts.PoolClass, opts.Path, false, result.Account, result.WaitMS, result.Attempts, string(opts.Body))
 		headers := passthroughHeaders(result.Header)
 		for k, v := range decision.Headers() {
 			headers[k] = v
@@ -1188,17 +1188,18 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 					payload = map[string]any{"error": map[string]any{
 						"message": string(raw), "type": "upstream_error"}}
 				}
-				writeSSEFrame(w, flusher, payload)
-				s.logUsageFull(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts)
-				return
-			}
-			s.Store.ChargeKey(item.Key)
-			writeSSEComment(w, flusher, fmt.Sprintf("baiPiao-hub account=%s wait_ms=%d attempts=%d model=%s",
-				safeHeader(result.Account.Name), result.WaitMS, result.Attempts, result.ModelUsed))
-			_, _ = io.Copy(&flushWriter{w: w, f: flusher}, result.Stream)
-			result.Close()
-			s.logUsageFull(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts)
+			writeSSEFrame(w, flusher, payload)
+			s.logUsageFull(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts, string(opts.Body))
 			return
+		}
+		writeSSEComment(w, flusher, fmt.Sprintf("baiPiao-hub account=%s wait_ms=%d attempts=%d model=%s",
+			safeHeader(result.Account.Name), result.WaitMS, result.Attempts, result.ModelUsed))
+		tail := &sseTail{w: &flushWriter{w: w, f: flusher}, cap: 1 << 16}
+		_, _ = io.Copy(tail, result.Stream)
+		result.Close()
+		s.Store.ChargeKey(item.Key, tail.usage())
+		s.logUsageFull(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts, string(opts.Body))
+		return
 		case <-ticker.C:
 			writeSSEComment(w, flusher, "agnes-hub waiting for rate-limit slot")
 		case <-ctx.Done():
@@ -1224,7 +1225,6 @@ func (s *Server) finishStream(w http.ResponseWriter, item *config.DownstreamKey,
 		writeJSON(w, result.Status, decodeOrRaw(raw), headers)
 		return
 	}
-	s.Store.ChargeKey(item.Key)
 	headers := passthroughHeaders(result.Header)
 	for k, v := range decision.Headers() {
 		headers[k] = v
@@ -1242,9 +1242,11 @@ func (s *Server) finishStream(w http.ResponseWriter, item *config.DownstreamKey,
 	}
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
-	_, _ = io.Copy(&flushWriter{w: w, f: flusher}, result.Stream)
+	tail := &sseTail{w: &flushWriter{w: w, f: flusher}, cap: 1 << 16}
+	_, _ = io.Copy(tail, result.Stream)
 	result.Close()
-	s.logUsageFull(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts)
+	s.Store.ChargeKey(item.Key, tail.usage())
+	s.logUsageFull(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts, string(opts.Body))
 }
 
 type flushWriter struct {
@@ -1307,11 +1309,14 @@ func (s *Server) logUsage(item *config.DownstreamKey, decision intent.Result, po
 }
 
 func (s *Server) logUsageFull(item *config.DownstreamKey, decision intent.Result, poolClass,
-	path string, stream bool, account *config.Account, waitMS int64, attempts int) {
+	path string, stream bool, account *config.Account, waitMS int64, attempts int,
+	userRequest string) {
 	acctName, acctID := "", ""
 	if account != nil {
 		acctName, acctID = account.Name, account.ID
 	}
+	// 用户提出的完整请求：截断到 8KB，避免图文/视频 base64 把日志撑爆。
+	ur := requestLog(userRequest)
 	s.Store.AppendUsage(map[string]any{
 		"ts": time.Now().Format("2006-01-02 15:04:05"), "phase": "done",
 		"endpoint": path, "pool_class": poolClass,
@@ -1320,7 +1325,93 @@ func (s *Server) logUsageFull(item *config.DownstreamKey, decision intent.Result
 		"model_requested": decision.ModelRequested, "model_used": decision.ModelUsed,
 		"key_name": item.Name, "account": acctName, "account_id": acctID,
 		"wait_ms": waitMS, "attempts": attempts, "stream": stream,
+		"user_request": ur,
 	})
+}
+
+// requestLog 把用户完整请求收敛到安全长度（长请求含 base64，只保留前 8KB）。
+func requestLog(s string) string {
+	const max = 8192
+	if len(s) > max {
+		return s[:max] + " …(truncated)"
+	}
+	return s
+}
+
+// mustJSON 把任意值编码为 JSON 字符串（用于把解码后的请求体重新序列化进日志）。
+func mustJSON(v any) string {
+	if v == nil {
+		return ""
+	}
+	buf, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return string(buf)
+}
+
+// extractUsage 从 OpenAI 格式响应体解析 token 用量（total_tokens）；解析不到返回 0。
+func extractUsage(raw []byte) int64 {
+	var probe struct {
+		Usage struct {
+			TotalTokens      int64 `json:"total_tokens"`
+			CompletionTokens int64 `json:"completion_tokens"`
+			PromptTokens     int64 `json:"prompt_tokens"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal(raw, &probe) == nil {
+		if probe.Usage.TotalTokens > 0 {
+			return probe.Usage.TotalTokens
+		}
+		// 某些上游只给 prompt/completion 不给 total：相加兜底。
+		if probe.Usage.PromptTokens > 0 || probe.Usage.CompletionTokens > 0 {
+			return probe.Usage.PromptTokens + probe.Usage.CompletionTokens
+		}
+	}
+	return 0
+}
+
+// sseTail 在转发 SSE 流给客户端的同时，保留末尾片段用于解析流末的 usage。
+type sseTail struct {
+	w   io.Writer
+	buf []byte
+	cap int
+}
+
+func (t *sseTail) Write(p []byte) (int, error) {
+	n, err := t.w.Write(p)
+	if err != nil {
+		return n, err
+	}
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > t.cap {
+		t.buf = t.buf[len(t.buf)-t.cap:]
+	}
+	return n, nil
+}
+
+// usage 逐 data: 行解析 SSE，取最后一个成功解析出 usage 的 total_tokens。
+func (t *sseTail) usage() int64 {
+	var total int64
+	for _, line := range strings.Split(string(t.buf), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		var probe struct {
+			Usage struct {
+				TotalTokens int64 `json:"total_tokens"`
+			} `json:"usage"`
+		}
+		if json.Unmarshal([]byte(payload), &probe) == nil && probe.Usage.TotalTokens > 0 {
+			total = probe.Usage.TotalTokens
+		}
+	}
+	return total
 }
 
 func relayError(err error) *apiError {

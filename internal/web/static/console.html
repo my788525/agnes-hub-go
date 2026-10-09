@@ -546,6 +546,7 @@ function viewKeys(){
       <td>${esc((k.Classes||k.classes||[]).join(", "))}</td>
       <td class="mono">${num(k.UsedToday??k.used_today)} / ${num(k.DailyQuota??k.daily_quota)||"∞"}</td>
       <td class="mono">${num(k.UsedTotal??k.used_total)} / ${num(k.TotalQuota??k.total_quota)||"∞"}</td>
+      <td class="mono" title="今日 token / 累计 token">${num(k.UsedTokensToday??k.used_tokens_today)} / ${num(k.UsedTokensTotal??k.used_tokens_total)}</td>
       <td>${(k.Enabled??k.enabled)?'<span class="pill ok">启用</span>':'<span class="pill off">停用</span>'}</td>
       <td><button class="sm danger" data-del="${esc(k.Key||k.key)}">删除</button></td>
     </tr>`).join("");
@@ -564,8 +565,8 @@ function viewKeys(){
   <div class="card">
     <h2>密钥列表</h2>
     <div class="scroll"><table>
-      <thead><tr><th>名称</th><th>密钥</th><th>允许池</th><th>今日</th><th>累计</th><th>状态</th><th></th></tr></thead>
-      <tbody>${rows||'<tr><td colspan="7" class="muted">暂无密钥</td></tr>'}</tbody>
+      <thead><tr><th>名称</th><th>密钥</th><th>允许池</th><th>今日</th><th>累计</th><th>token</th><th>状态</th><th></th></tr></thead>
+      <tbody>${rows||'<tr><td colspan="8" class="muted">暂无密钥</td></tr>'}</tbody>
     </table></div>
   </div>`;
 }
@@ -629,11 +630,12 @@ function viewLogs(){
     <td>${esc(l.pool_class||"")}</td>
     <td>${esc(l.account||"")}</td>
     <td class="mono">${l.wait_ms!=null?Math.round(l.wait_ms)+"ms":""}</td>
-    <td>${esc(l.phase||"")}</td></tr>`).join("");
+    <td>${esc(l.phase||"")}</td>
+    <td class="mono" style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(l.user_request||"")}">${esc((l.user_request||"").slice(0,90))}</td></tr>`).join("");
   return `<div class="card"><div class="spread"><h2>用量日志</h2>
-      <div class="muted">含每次请求的意图判定依据（intent_by / intent_score / reason）</div></div>
-    <div class="scroll"><table><thead><tr><th>时间</th><th>意图</th><th>模型</th><th>池</th><th>账号</th><th>等待</th><th>阶段</th></tr></thead>
-      <tbody>${rows||'<tr><td colspan="7" class="muted">暂无日志</td></tr>'}</tbody></table></div></div>`;
+      <div class="muted">含每次请求的意图判定依据（intent_by / intent_score / reason）与用户提出的完整请求</div></div>
+    <div class="scroll"><table><thead><tr><th>时间</th><th>意图</th><th>模型</th><th>池</th><th>账号</th><th>等待</th><th>阶段</th><th>用户请求</th></tr></thead>
+      <tbody>${rows||'<tr><td colspan="8" class="muted">暂无日志</td></tr>'}</tbody></table></div></div>`;
 }
 function viewIntent(){
   return `
@@ -725,6 +727,7 @@ function viewSettings(){
       ${fld("s_vconc","视频在任务上限", s.video_max_inflight??2,"number","独立于 RPM 的任务级限制：只做 RPM 不做任务数会出现「RPM 没超但视频一直失败」")}
       ${fld("s_brev","熔断自动复活（秒）", s.breaker_revive_sec??1800,"number","401/403/402 熔断后到这个时间自动复活低速试探")}
       ${fld("s_rqtimeout","请求超时（毫秒）", s.request_timeout_ms??30000,"number","单次上游请求最长等待时间，防 hang 死连接")}
+      ${fld("s_free_text_rpm","agnes 免费档文本 RPM", s.free_text_rpm??10,"number","agnes 免费账号文本池标称 RPM（已降至 10）；修改后立即生效。per-account 的 rpm_overrides 仍优先此值")}
     </div>
   </div>
   <div class="card">
@@ -801,7 +804,8 @@ function bindSettingsEvents(){
       retry_base_backoff_ms:Number(g("s_rbase")), retry_max_backoff_ms:Number(g("s_rmax")),
       probe_model:g("s_probe"), session_ttl_hours:Number(g("s_ttl")),
       optimization_mode:g("s_opt_mode"), image_record_retention_days:Number(g("s_img_ret")),
-      image_max_capacity:Number(g("s_img_cap")), video_max_capacity:Number(g("s_vid_cap"))
+      image_max_capacity:Number(g("s_img_cap")), video_max_capacity:Number(g("s_vid_cap")),
+      free_text_rpm:Number(g("s_free_text_rpm"))
     };
     MODALITIES.forEach(m=>payload.auto_intent.preferred_models[m] =
       g("s_pref_"+m).split(",").map(x=>x.trim()).filter(Boolean));
