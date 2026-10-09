@@ -4,8 +4,11 @@
 agnes-hub-go
 agnes-hub-go-linux-amd64
 agnes-hub-go-linux-arm64
+agnes-hub-go-linux-amd64-*   # 版本化发布副本（上传 Release 后即冗余）
+agnes-hub-go-linux-arm64-*
 baipiao-hub-linux-amd64
 baipiao-hub-linux-arm64
+release_*.py   # 一次性发布脚本（内含 GitHub PAT，绝不入库）
 
 # 运行期数据：含上游 API Key 与管理员口令散列，绝不提交
 data/
