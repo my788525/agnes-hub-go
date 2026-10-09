@@ -14,6 +14,7 @@ package relay
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -361,6 +362,25 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 		idleMS = 60000 // 默认 60s 空闲才断开
 	}
 
+	// ---- #29 效率增强（内容零改动，仅改传输/缓存提示）----
+	// P0：Anthropic 路径注入 cache_control，让上游对反复出现的静态前缀
+	//     （system + tools）做前缀缓存，避免每轮重算 prefill。
+	// P1：对上传请求体做 gzip，削减 ~500KB 的网关→上游带宽
+	//     （需上游支持解压 gzip 请求体，故默认关闭、确认后再开）。
+	if opts.Anthropic && s.AnthropicPromptCache {
+		if mod, ok := addAnthropicCacheControl(body); ok {
+			body = mod
+		}
+	}
+	sendBody := body
+	gzipEncode := false
+	if s.UpstreamRequestGzip {
+		if gz, ok := gzipBytes(body); ok {
+			sendBody = gz
+			gzipEncode = true
+		}
+	}
+
 	var (
 		reqCtx context.Context
 		cancel context.CancelFunc
@@ -371,13 +391,17 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 		reqCtx, cancel = context.WithTimeout(ctx, time.Duration(timeoutMS)*time.Millisecond)
 	}
 
-	req, err := http.NewRequestWithContext(reqCtx, opts.Method, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(reqCtx, opts.Method, url, bytes.NewReader(sendBody))
 	if err != nil {
 		cancel() // P2：request 构造失败时也取消 context，避免泄漏（vet 提示）。
 		return nil, false, err
 	}
 	for k, values := range ClientHeaders(account, opts.ExtraHeaders, opts.Anthropic) {
 		req.Header[k] = values
+	}
+	// P1：已对请求体做 gzip 压缩，声明编码并让 Go 按压缩后字节数自动设 Content-Length。
+	if gzipEncode {
+		req.Header.Set("Content-Encoding", "gzip")
 	}
 
 	// 单账号并发上限（按模态分离，避免视频轮询挤占文本请求）
@@ -664,4 +688,58 @@ func errorBody(message, etype string) []byte {
 		"error": map[string]any{"message": message, "type": etype},
 	})
 	return buf
+}
+
+// gzipBytes 把请求体压缩为 gzip（#29 P1）。失败返回 (nil, false)，调用方应原样发送。
+func gzipBytes(in []byte) ([]byte, bool) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if _, err := gz.Write(in); err != nil {
+		return nil, false
+	}
+	if err := gz.Close(); err != nil {
+		return nil, false
+	}
+	return buf.Bytes(), true
+}
+
+// addAnthropicCacheControl 在 Anthropic 风格请求体上注入前缀缓存断点（#29 P0）：
+// 把顶层 system 标为可缓存块（ephemeral），使上游对重复出现的巨大静态前缀
+// （system + tools）不再每轮重算 prefill。仅当上游兼容 Anthropic cache_control
+// 时才有收益；不兼容时该字段被忽略，内容不受影响。agnes 主路径的 system 位于
+// messages 内（OpenAI 风格），此处找不到顶层 system 时安全 no-op。
+func addAnthropicCacheControl(body []byte) ([]byte, bool) {
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return body, false
+	}
+	changed := false
+	if sys, ok := doc["system"]; ok {
+		switch v := sys.(type) {
+		case string:
+			doc["system"] = []any{map[string]any{
+				"type":          "text",
+				"text":          v,
+				"cache_control": map[string]any{"type": "ephemeral"},
+			}}
+			changed = true
+		case []any:
+			if len(v) > 0 {
+				if blk, ok := v[len(v)-1].(map[string]any); ok {
+					if _, has := blk["cache_control"]; !has {
+						blk["cache_control"] = map[string]any{"type": "ephemeral"}
+						changed = true
+					}
+				}
+			}
+		}
+	}
+	if !changed {
+		return body, false
+	}
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return body, false
+	}
+	return out, true
 }

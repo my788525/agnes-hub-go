@@ -175,6 +175,45 @@ def deploy(nas, local_bin):
     print(nas.run("curl -s http://127.0.0.1:%d/healthz" % PORT).strip())
 
 
+def set_policy(nas, policy):
+    """把 data/settings.json 的 system_prompt_policy 改为指定值并重启服务。"""
+    print("[1] 停服")
+    nas.run("appcenter-cli stop %s 2>&1" % APP_ID)
+    print(nas.sudo_pty("pkill -9 -x baipiao-hub; true", timeout=30).strip())
+    time.sleep(2)
+    sp = DATA_DIR + "/settings.json"
+    local_tmp = os.path.join(ROOT, ".gotmp", "settings.json")
+    os.makedirs(os.path.dirname(local_tmp), exist_ok=True)
+    raw = nas.sudo_pty("cat %s" % sp, timeout=30)
+    i = raw.find('{')
+    j = raw.rfind('}')
+    if i == -1 or j == -1:
+        sys.stderr.write("DBG raw=%r\n" % raw)
+        sys.exit("[ERROR] 无法从 sudo cat 输出解析 settings.json")
+    cfg = json.loads(raw[i:j + 1])
+    old = cfg.get("system_prompt_policy", "")
+    cfg["system_prompt_policy"] = policy
+    with open(local_tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    nas.put(local_tmp, "/tmp/settings.json")
+    print(nas.sudo_pty("cp -f /tmp/settings.json %s && chown agnes-hub:agnes-hub %s && echo WRITTEN"
+                       % (sp, sp), timeout=30).strip())
+    print("    system_prompt_policy: %r -> %r" % (old, policy))
+    print("[2] PTY sudo 启动")
+    nas.sudo_pty("appcenter-cli stop %s 2>&1; true" % APP_ID, timeout=60)
+    time.sleep(2)
+    out = nas.sudo_pty("appcenter-cli start %s" % APP_ID, timeout=60)
+    print(out.strip())
+    if "already started" in out:
+        exe = "/vol1/@appcenter/%s/app/baipiao-hub" % APP_ID
+        print("[2b] 兜底：nohup 直启")
+        print(nas.sudo_pty("nohup %s -host 0.0.0.0 -port %d -data %s >> %s/app.log 2>&1 &"
+                           % (exe, PORT, DATA_DIR, DATA_DIR), timeout=30).strip())
+    time.sleep(4)
+    print("[3] 健康检查")
+    print(nas.run("curl -s http://127.0.0.1:%d/healthz" % PORT).strip())
+
+
 def set_capture(nas, enabled):
     print("[1] 停服")
     nas.run("appcenter-cli stop %s 2>&1" % APP_ID)
@@ -241,6 +280,47 @@ def health(nas):
     print("PROC:", nas.run("pgrep -af baipiao-hub || echo NONE").strip())
 
 
+def set_opt(nas, key, value):
+    """通用 settings.json 开关：把某个布尔/字符串设置改为 value 并重启服务。
+    用于 #29 的效率开关（upstream_request_gzip / anthropic_prompt_cache）等。"""
+    enabled = value.lower() in ("on", "1", "true", "yes")
+    print("[1] 停服")
+    nas.run("appcenter-cli stop %s 2>&1" % APP_ID)
+    print(nas.sudo_pty("pkill -9 -x baipiao-hub; true", timeout=30).strip())
+    time.sleep(2)
+    sp = DATA_DIR + "/settings.json"
+    local_tmp = os.path.join(ROOT, ".gotmp", "settings.json")
+    os.makedirs(os.path.dirname(local_tmp), exist_ok=True)
+    raw = nas.sudo_pty("cat %s" % sp, timeout=30)
+    i = raw.find('{')
+    j = raw.rfind('}')
+    if i == -1 or j == -1:
+        sys.stderr.write("DBG raw=%r\n" % raw)
+        sys.exit("[ERROR] 无法从 sudo cat 输出解析 settings.json")
+    cfg = json.loads(raw[i:j + 1])
+    old = cfg.get(key)
+    cfg[key] = bool(enabled)
+    with open(local_tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    nas.put(local_tmp, "/tmp/settings.json")
+    print(nas.sudo_pty("cp -f /tmp/settings.json %s && chown agnes-hub:agnes-hub %s && echo WRITTEN"
+                       % (sp, sp), timeout=30).strip())
+    print("    %s: %r -> %r" % (key, old, bool(enabled)))
+    print("[2] PTY sudo 启动")
+    nas.sudo_pty("appcenter-cli stop %s 2>&1; true" % APP_ID, timeout=60)
+    time.sleep(2)
+    out = nas.sudo_pty("appcenter-cli start %s" % APP_ID, timeout=60)
+    print(out.strip())
+    if "already started" in out:
+        exe = "/vol1/@appcenter/%s/app/baipiao-hub" % APP_ID
+        print("[2b] 兜底：nohup 直启")
+        print(nas.sudo_pty("nohup %s -host 0.0.0.0 -port %d -data %s >> %s/app.log 2>&1 &"
+                           % (exe, PORT, DATA_DIR, DATA_DIR), timeout=30).strip())
+    time.sleep(4)
+    print("[3] 健康检查")
+    print(nas.run("curl -s http://127.0.0.1:%d/healthz" % PORT).strip())
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "health"
     nas = Nas(HOST, load_password())
@@ -251,12 +331,19 @@ def main():
         elif mode == "capture":
             sub = sys.argv[2] if len(sys.argv) > 2 else "on"
             set_capture(nas, sub.lower() in ("on", "1", "true"))
+        elif mode == "setpolicy":
+            pol = sys.argv[2] if len(sys.argv) > 2 else "forward"
+            set_policy(nas, pol)
         elif mode == "fetch":
             fetch(nas)
+        elif mode == "setopt":
+            if len(sys.argv) < 4:
+                sys.exit("用法: setopt <key> <on|off>")
+            set_opt(nas, sys.argv[2], sys.argv[3])
         elif mode == "health":
             health(nas)
         else:
-            print("未知模式；用法: deploy|capture on|off|fetch|health")
+            print("未知模式；用法: deploy|capture on|off|setpolicy <policy>|setopt <key> <on|off>|fetch|health")
     finally:
         nas.close()
 

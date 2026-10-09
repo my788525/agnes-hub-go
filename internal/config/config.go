@@ -352,6 +352,16 @@ type Settings struct {
 	// （未经 system_prompt_policy 改写、未截断）落到 data/raw_capture/ 目录，
 	// 每个请求一个文件，用于排障与「请求字段全量分析」。默认 false（关闭）。
 	RawCaptureEnabled bool `json:"raw_capture_enabled"`
+	// UpstreamRequestGzip 开启后，网关对发往上游的请求体做 gzip 压缩
+	// （Content-Encoding: gzip），削减网关→上游的带宽（WorkBuddy 单请求体常达
+	// ~500KB，gzip 可压到 1/5~1/8）。前提：上游须支持解压 gzip 请求体；
+	// 不支持的上游会返回 400。默认 false，由运维在确认上游兼容后开启（见 #29）。
+	UpstreamRequestGzip bool `json:"upstream_request_gzip"`
+	// AnthropicPromptCache 开启后，网关在 Anthropic 风格（/v1/messages）请求体的
+	// 顶层 system 块注入 cache_control:{type:"ephemeral"}，让上游对反复出现的
+	// 巨大静态前缀（system + tools）做前缀缓存，避免每轮重算 prefill。仅当上游
+	// 兼容 Anthropic 前缀缓存时生效；不兼容时该字段被忽略，内容不受影响（见 #29）。
+	AnthropicPromptCache bool `json:"anthropic_prompt_cache"`
 	ChatPasswordHash     string `json:"chat_password_hash,omitempty"`
 	ChatPasswordSalt     string `json:"chat_password_salt,omitempty"`
 }
@@ -375,7 +385,7 @@ var SystemPromptPolicyValues = map[string]bool{
 // 以及 Anthropic 风格的顶层 system 字段；其余字段（tools / tool_choice / thinking /
 // stream / stream_options / model / temperature / messages 里的 user/assistant/tool 等）
 // 一律原样保留，从而工具调用与思考能力绝不会被误伤。
-// policy 为 "" 或 "forward" 时直接返回，不做任何改动（零回归）。
+// 默认 forward（含 ""）时直接返回，不改动任何内容（零回归）。
 func ApplySystemPromptPolicy(body map[string]any, st Settings) {
 	policy := st.SystemPromptPolicy
 	if policy == "" || policy == "forward" {

@@ -30,6 +30,7 @@ __pycache__/
 .workbuddy/request_full_analysis.html
 .workbuddy/request_fields_full.html
 .workbuddy/request_strip_analysis.html
+.workbuddy/gateway_efficiency_audit.html
 
 # NAS 口令（tools/deploy_nas.py 会读它，绝不提交）
 .nas_pass

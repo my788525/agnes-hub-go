@@ -131,3 +131,4 @@ func TestApplySystemPromptPolicy_AnthropicTopLevelSystem(t *testing.T) {
 		t.Fatal("strip 后不应有 system 消息")
 	}
 }
+

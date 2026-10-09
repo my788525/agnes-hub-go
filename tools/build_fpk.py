@@ -318,6 +318,13 @@ exit 0
 TRIVIAL = "#!/bin/bash\nexit 0\n"
 
 CHANGELOG = (
+    "1.0.21→1.0.22：网关执行效率优化（#29，内容零改动、保留 WorkBuddy 绝大部分提交内容）——新增两项可开关的传输/缓存增强："
+    "P0 前缀缓存（anthropic_prompt_cache，Anthropic 路径顶层 system 注入 cache_control:ephemeral，让上游对反复出现的巨大静态前缀做前缀缓存、避免每轮重算 prefill）；"
+    "P1 请求体 gzip（upstream_request_gzip，对发往上游的 ~500KB 请求体做 gzip 压缩，削减网关→上游带宽到 1/5~1/8）；"
+    "两项默认均关闭，由运维在确认上游兼容后开启（gzip 需上游支持解压 gzip 请求体，否则会 400）；"
+    "同时清理 v1.0.21 在 forward 下为死代码的 <content_policy> 全局剥离实现（线上未生效，且与「保留内容」方向冲突）。"
+    "1.0.20→1.0.21：按用户要求全局去除 system 提示词中的 <content_policy> 区块——无论何种策略（forward 即生效），进入 ApplySystemPromptPolicy 先剥离该区块，其余区块与 tools/thinking/stream 等能力字段原样保留；"
+    "停用 override 等其它精简模式（部署切回 forward），仅做此最小化剥离。"
     "1.0.20：修复控制台用量日志「查看请求」弹窗显示内容——此前直接展示最后一条 user 消息的完整原文（含 WorkBuddy 注入的 <system-reminder> 等多层系统开销）；"
     "现落盘前用 intent.CleanUserMessage 剥离 system-reminder、只取 <user_query> 内的真实用户输入，普通 chat 请求（无包裹）原样透传、零副作用；弹窗因此只显示用户消息本身。"
     "1.0.19：新增「上游上下文策略（系统提示词）」——控制发给上游模型的 system 提示词如何处理，且【只动 system 内容，工具调用与思考能力始终保留】；"
