@@ -318,6 +318,11 @@ exit 0
 TRIVIAL = "#!/bin/bash\nexit 0\n"
 
 CHANGELOG = (
+    "1.0.22→1.0.23：按用户要求彻底移除「上游上下文策略（系统提示词）」模式（forward/strip/override/scenario）——"
+    "后台控制台不再提供该模式选择卡片，网关对 WorkBuddy 提交的内容一律原样转发（不再改写/剥离 system）；"
+    "同时把 #29 的效率优化定为默认开启：发往上游的请求体默认 gzip 压缩（upstream_request_gzip 默认 true，"
+    "已验证上游 agnes 兼容解压 gzip 请求体，个别不兼容上游可手动关闭）；"
+    "前缀缓存（anthropic_prompt_cache）仍为可开关项。"
     "1.0.21→1.0.22：网关执行效率优化（#29，内容零改动、保留 WorkBuddy 绝大部分提交内容）——新增两项可开关的传输/缓存增强："
     "P0 前缀缓存（anthropic_prompt_cache，Anthropic 路径顶层 system 注入 cache_control:ephemeral，让上游对反复出现的巨大静态前缀做前缀缓存、避免每轮重算 prefill）；"
     "P1 请求体 gzip（upstream_request_gzip，对发往上游的 ~500KB 请求体做 gzip 压缩，削减网关→上游带宽到 1/5~1/8）；"

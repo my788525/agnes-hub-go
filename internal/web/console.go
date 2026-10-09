@@ -1230,10 +1230,6 @@ func applySettings(st *config.Settings, p map[string]any) {
 	}
 	i("rate_limit_retry_max", &st.RateLimitRetryMax)
 	i("rate_limit_wait_budget_ms", &st.RateLimitWaitBudgetMS)
-	// #26：上游上下文策略（只动 system 提示词，工具/思考能力保留）。
-	s2("system_prompt_policy", &st.SystemPromptPolicy)
-	s2("system_prompt_override", &st.SystemPromptOverride)
-
 	if v, ok := p["model_aliases"].(map[string]any); ok {
 		next := map[string]string{}
 		for k, raw := range v {

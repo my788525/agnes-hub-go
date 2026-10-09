@@ -604,18 +604,10 @@ func (s *Server) handleTextish(w http.ResponseWriter, r *http.Request, path stri
 		return
 	}
 	settings := s.Store.SettingsSnapshot()
-	// #27：原始请求全量捕获（排障/请求字段分析用）：在 system_prompt_policy 改写前，
-	// 把 WorkBuddy 发来的完整原始请求体落盘，便于逐字段翻译分析。默认关闭。
+	// #27：原始请求全量捕获（排障/请求字段分析用）：把 WorkBuddy 发来的完整原始
+	// 请求体（未截断、未改写）落盘，便于逐字段翻译分析。默认关闭。
 	if settings.RawCaptureEnabled {
 		s.Store.CaptureRawRequest(rawBody)
-	}
-	// #26：按「上游上下文策略」调整发给上游的 system 提示词（默认 forward 不改动）。
-	// 工具调用 / 思考等能力字段一律保留，只剥离或替换 system 内容，避免误伤。
-	if settings.SystemPromptPolicy != "" && settings.SystemPromptPolicy != "forward" {
-		config.ApplySystemPromptPolicy(body, settings)
-		if rb, jerr := json.Marshal(body); jerr == nil {
-			rawBody = rb
-		}
 	}
 	requested := strings.TrimSpace(asStr(body["model"]))
 	wantsStream := truthy(body["stream"])
@@ -719,14 +711,9 @@ func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request, path, modal
 		return
 	}
 	settings := s.Store.SettingsSnapshot()
-	// #27：原始请求全量捕获（排障/请求字段分析用），在 system_prompt_policy 改写前落盘。
+	// #27：原始请求全量捕获（排障/请求字段分析用），未截断、未改写的原始体落盘。
 	if settings.RawCaptureEnabled {
 		s.Store.CaptureRawRequest(rawBody)
-	}
-	// #26：媒体端点同样按上下文策略处理 system（媒体体通常无 system，剥离为 no-op；
-	// override/scenario 注入的 system 信息对图像/视频 API 无害，会被忽略）。
-	if settings.SystemPromptPolicy != "" && settings.SystemPromptPolicy != "forward" {
-		config.ApplySystemPromptPolicy(body, settings)
 	}
 	requested := strings.TrimSpace(asStr(body["model"]))
 	wantsStream := truthy(body["stream"])

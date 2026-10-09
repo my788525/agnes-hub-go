@@ -809,23 +809,6 @@ function viewSettings(){
     </div>
   </div>
   <div class="card">
-    <h2>上游上下文策略（系统提示词）</h2>
-    <div class="hint">控制发给上游模型的 <b>system 提示词</b> 如何处理。<b>只动 system 内容，工具调用与思考能力始终保留。</b></div>
-    <div class="row" style="gap:10px;align-items:flex-start;margin-top:8px">
-      <div style="flex:0 0 300px"><label>策略模式</label>
-        <select id="s_spp_mode">
-          <option value="forward" ${(s.system_prompt_policy==="forward"||!s.system_prompt_policy)?"selected":""}>转发（原样发送，默认）</option>
-          <option value="strip" ${s.system_prompt_policy==="strip"?"selected":""}>仅剥离 system（最省 token）</option>
-          <option value="override" ${s.system_prompt_policy==="override"?"selected":""}>覆盖为自定义提示词</option>
-          <option value="scenario" ${s.system_prompt_policy==="scenario"?"selected":""}>按情景匹配前置提示词</option>
-        </select>
-        <div class="hint">override/scenario 的提示词留空时，回退内置「代码生成」默认提示词</div></div>
-      <div style="flex:1"><label>自定义前置提示词（override 用，留空=内置代码生成默认）</label>
-        <textarea id="s_spp_override" rows="5" style="width:100%;font-family:monospace;resize:vertical">${esc(s.system_prompt_override||"")}</textarea>
-        <div class="hint">面向在 WorkBuddy 上写代码优化；可写任意前置上下文，工具/思考能力不受影响</div></div>
-    </div>
-  </div>
-  <div class="card">
     <h2>统一模型入口（auto）</h2>
     <div class="grid g2">
       ${fld("s_auto_name","对外统一模型名", s.auto_model_name||"auto","text","客户端只填这个名字，网关自动判定模态")}
@@ -946,9 +929,7 @@ function bindSettingsEvents(){
       text_two_level_queue:document.getElementById("s_two_level")?document.getElementById("s_two_level").checked:false,
       auto_scenario:document.getElementById("s_auto_scenario")?document.getElementById("s_auto_scenario").checked:false,
       rate_limit_retry_max:Number(document.getElementById("s_rl_retry_max")?document.getElementById("s_rl_retry_max").value:0),
-      rate_limit_wait_budget_ms:Number(document.getElementById("s_rl_wait_budget_s")?document.getElementById("s_rl_wait_budget_s").value*1000:0),
-      system_prompt_policy:document.getElementById("s_spp_mode")?document.getElementById("s_spp_mode").value:"forward",
-      system_prompt_override:document.getElementById("s_spp_override")?document.getElementById("s_spp_override").value:""
+      rate_limit_wait_budget_ms:Number(document.getElementById("s_rl_wait_budget_s")?document.getElementById("s_rl_wait_budget_s").value*1000:0)
     };
     MODALITIES.forEach(m=>payload.auto_intent.preferred_models[m] =
       g("s_pref_"+m).split(",").map(x=>x.trim()).filter(Boolean));
