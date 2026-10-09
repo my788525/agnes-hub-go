@@ -604,6 +604,14 @@ func (s *Server) handleTextish(w http.ResponseWriter, r *http.Request, path stri
 		return
 	}
 	settings := s.Store.SettingsSnapshot()
+	// #26：按「上游上下文策略」调整发给上游的 system 提示词（默认 forward 不改动）。
+	// 工具调用 / 思考等能力字段一律保留，只剥离或替换 system 内容，避免误伤。
+	if settings.SystemPromptPolicy != "" && settings.SystemPromptPolicy != "forward" {
+		config.ApplySystemPromptPolicy(body, settings)
+		if rb, jerr := json.Marshal(body); jerr == nil {
+			rawBody = rb
+		}
+	}
 	requested := strings.TrimSpace(asStr(body["model"]))
 	wantsStream := truthy(body["stream"])
 
@@ -706,6 +714,11 @@ func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request, path, modal
 		return
 	}
 	settings := s.Store.SettingsSnapshot()
+	// #26：媒体端点同样按上下文策略处理 system（媒体体通常无 system，剥离为 no-op；
+	// override/scenario 注入的 system 信息对图像/视频 API 无害，会被忽略）。
+	if settings.SystemPromptPolicy != "" && settings.SystemPromptPolicy != "forward" {
+		config.ApplySystemPromptPolicy(body, settings)
+	}
 	requested := strings.TrimSpace(asStr(body["model"]))
 	wantsStream := truthy(body["stream"])
 
@@ -820,7 +833,7 @@ func (s *Server) serveAutoImage(w http.ResponseWriter, r *http.Request, item *co
 	raw := result.ReadAll()
 	decision.ModelUsed = result.ModelUsed
 	s.Store.ChargeKey(item.Key, extractUsage(raw))
-	s.logUsageFull(item, decision, poolClass, "/v1/images/generations", chatShape, result.Account, result.WaitMS, result.Attempts, mustJSON(body))
+	s.logUsageFull(item, decision, poolClass, "/v1/images/generations", chatShape, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text)
 
 	// 记录图片生成结果（便于控制台查看历史）
 	requestID := config.NewID("img")
@@ -932,7 +945,7 @@ func (s *Server) serveAutoVideo(w http.ResponseWriter, r *http.Request, item *co
 	}
 	raw := result.ReadAll()
 	decision.ModelUsed = result.ModelUsed
-	s.logUsageFull(item, decision, poolClass, "/v1/videos", chatShape, result.Account, result.WaitMS, result.Attempts, mustJSON(body))
+	s.logUsageFull(item, decision, poolClass, "/v1/videos", chatShape, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text)
 
 	extra := decision.Headers()
 	extra["X-Agnes-Hub-Account"] = safeHeader(result.Account.Name)
@@ -1206,7 +1219,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 		if result.Status < 400 {
 			s.Store.ChargeKey(item.Key, extractUsage(raw))
 		}
-		s.logUsageFull(item, decision, opts.PoolClass, opts.Path, false, result.Account, result.WaitMS, result.Attempts, string(opts.Body))
+		s.logUsageFull(item, decision, opts.PoolClass, opts.Path, false, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text)
 		headers := passthroughHeaders(result.Header)
 		for k, v := range decision.Headers() {
 			headers[k] = v
@@ -1299,7 +1312,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 						"message": string(raw), "type": "upstream_error"}}
 				}
 			writeSSEFrame(w, flusher, payload)
-			s.logUsageFull(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts, string(opts.Body))
+			s.logUsageFull(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text)
 			return
 		}
 		writeSSEComment(w, flusher, fmt.Sprintf("baiPiao-hub account=%s wait_ms=%d attempts=%d model=%s",
@@ -1308,7 +1321,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 		_, _ = io.Copy(tail, result.Stream)
 		result.Close()
 		s.Store.ChargeKey(item.Key, tail.usage())
-		s.logUsageFull(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts, string(opts.Body))
+		s.logUsageFull(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text)
 		return
 		case <-ticker.C:
 			writeSSEComment(w, flusher, "agnes-hub waiting for rate-limit slot")
@@ -1359,7 +1372,7 @@ func (s *Server) finishStream(w http.ResponseWriter, item *config.DownstreamKey,
 	_, _ = io.Copy(tail, result.Stream)
 	result.Close()
 	s.Store.ChargeKey(item.Key, tail.usage())
-	s.logUsageFull(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts, string(opts.Body))
+	s.logUsageFull(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text)
 }
 
 type flushWriter struct {
@@ -1418,8 +1431,10 @@ func (s *Server) logUsageFull(item *config.DownstreamKey, decision intent.Result
 	if account != nil {
 		acctName, acctID = account.Name, account.ID
 	}
-	// 用户提出的完整请求：截断到 8KB，避免图文/视频 base64 把日志撑爆。
-	ur := requestLog(userRequest)
+	// 用户提出的完整请求：截断到配置上限（UsageRequestLogBytes，默认 512），
+	// 避免图文/视频 base64 把日志撑爆。注意此处记录的是「用户真正提交的原文」
+	// （已在调用处传入 decision.Prompt.Text），已排除 system 提示词等上下文。
+	ur := requestLog(userRequest, s.Store.SettingsSnapshot().UsageRequestLogBytes)
 	s.Store.AppendUsage(map[string]any{
 		"ts": time.Now().Format("2006-01-02 15:04:05"), "phase": "done",
 		"endpoint": path, "pool_class": poolClass,
@@ -1432,11 +1447,14 @@ func (s *Server) logUsageFull(item *config.DownstreamKey, decision intent.Result
 	})
 }
 
-// requestLog 把用户完整请求收敛到安全长度（长请求含 base64，只保留前 8KB）。
-func requestLog(s string) string {
-	const max = 8192
-	if len(s) > max {
-		return s[:max] + " …(truncated)"
+// requestLog 把用户完整请求收敛到安全长度（长请求含 base64，只保留前 maxBytes 字节）。
+// maxBytes 来自配置 UsageRequestLogBytes（默认 512）；<=0 时兜底 512。
+func requestLog(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		maxBytes = 512
+	}
+	if len(s) > maxBytes {
+		return s[:maxBytes] + " …(truncated)"
 	}
 	return s
 }

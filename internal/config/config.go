@@ -334,8 +334,105 @@ type Settings struct {
 	// 周期性推荐并自动切换最贴合的情景（带冷却防抖，同一情景 60s 内不重复切）。
 	// 关闭时情景完全由人手在控制台选定/一键应用，不会静默翻转。默认 false。
 	AutoScenario bool `json:"auto_scenario"`
+	// SystemPromptPolicy 控制「发给上游的 system 提示词」如何处理（#26）：
+	//   "forward"  原样转发客户端带来的 system（含 WorkBuddy/agnes 强加的上下文与限制），默认、零回归
+	//   "strip"    剥离所有 system 提示词（messages 里的 system 角色 + 顶层 system 字段），只保留用户对话 + tools/thinking 等能力开关
+	//   "override" 用 SystemPromptOverride 覆盖 system 提示词（为空则回退内置「代码生成」默认提示词）
+	//   "scenario" 按请求模态自动匹配 PrePrompts 中的前置提示词（缺则回退 override / 内置默认）
+	// 该策略【只动 system 提示词内容】，绝不触碰 tools / tool_choice / thinking /
+	// stream_options 等能力字段，因此工具调用与思考能力始终保留。
+	SystemPromptPolicy string `json:"system_prompt_policy"`
+	// SystemPromptOverride 是 "override"/"scenario" 模式下使用的自定义前置提示词
+	// （代码生成优化等）。为空时回退到内置默认。
+	SystemPromptOverride string `json:"system_prompt_override"`
+	// PrePrompts 是 "scenario" 模式下的按模态前置提示词：key 为 text/image/video，
+	// 命中即用对应提示词覆盖 system；缺省回退 SystemPromptOverride，再回退内置默认。
+	PrePrompts map[string]string `json:"pre_prompts,omitempty"`
 	ChatPasswordHash     string `json:"chat_password_hash,omitempty"`
 	ChatPasswordSalt     string `json:"chat_password_salt,omitempty"`
+}
+
+// DefaultCodeSystemPrompt 是「代码生成」场景的内置默认 system 提示词（#26）：
+// 面向在 WorkBuddy 上写代码优化，保持工具调用与思考能力，不引入任何无关限制，
+// 且足够短以节省 token。始终用英文（上游 agnes 模型英文指令更稳）。
+const DefaultCodeSystemPrompt = `You are a coding assistant embedded in WorkBuddy. ` +
+	`Help the user write, debug, review, and refactor code across any language or framework. ` +
+	`Use the available tools whenever they help, and reason step by step on non-trivial problems. ` +
+	`Prefer clear, minimal, production-ready solutions. Reply in the user's language.`
+
+// SystemPromptPolicyValues 是 system_prompt_policy 的合法枚举值。
+var SystemPromptPolicyValues = map[string]bool{
+	"": false, "forward": true, "strip": true, "override": true, "scenario": true,
+}
+
+// ApplySystemPromptPolicy 按策略调整 body 的 system 提示词（#26）。
+//
+// 行为边界（关键）：只修改 system 提示词内容——即 messages 里 role=="system" 的消息，
+// 以及 Anthropic 风格的顶层 system 字段；其余字段（tools / tool_choice / thinking /
+// stream / stream_options / model / temperature / messages 里的 user/assistant/tool 等）
+// 一律原样保留，从而工具调用与思考能力绝不会被误伤。
+// policy 为 "" 或 "forward" 时直接返回，不做任何改动（零回归）。
+func ApplySystemPromptPolicy(body map[string]any, st Settings) {
+	policy := st.SystemPromptPolicy
+	if policy == "" || policy == "forward" {
+		return
+	}
+	// 1) 先剥离客户端带来的全部 system（无论哪种非 forward 模式都清掉，避免叠加）。
+	delete(body, "system") // Anthropic 顶层 system
+	if msgs, ok := body["messages"].([]any); ok {
+		kept := make([]any, 0, len(msgs))
+		for _, m := range msgs {
+			if mm, ok := m.(map[string]any); ok && asString(mm["role"]) == "system" {
+				continue
+			}
+			kept = append(kept, m)
+		}
+		body["messages"] = kept
+	}
+	// 2) 计算新的 system 文本（strip 模式为空 → 不加回）。
+	newSys := ""
+	switch policy {
+	case "override", "scenario":
+		newSys = resolveSystemPrompt(st, body)
+	}
+	if newSys == "" {
+		return
+	}
+	// 3) 前置一条 system 消息（保证在对话最前，符合 OpenAI/Anthropic 约定）。
+	sysMsg := map[string]any{"role": "system", "content": newSys}
+	if msgs, ok := body["messages"].([]any); ok {
+		body["messages"] = append([]any{sysMsg}, msgs...)
+	} else {
+		body["messages"] = []any{sysMsg}
+	}
+}
+
+// resolveSystemPrompt 解析 override/scenario 模式下的 system 文本（#26）。
+func resolveSystemPrompt(st Settings, body map[string]any) string {
+	if st.SystemPromptOverride != "" {
+		return st.SystemPromptOverride
+	}
+	if st.PrePrompts != nil {
+		if p, ok := st.PrePrompts[modalityOfBody(body)]; ok && p != "" {
+			return p
+		}
+	}
+	return DefaultCodeSystemPrompt
+}
+
+// modalityOfBody 粗略判断请求模态，用于 scenario 模式选 PrePrompts（#26）。
+// 有 messages → text；有 prompt 且疑似视频 → video；有 prompt 其余 → image。
+func modalityOfBody(body map[string]any) string {
+	if _, ok := body["messages"]; ok {
+		return "text"
+	}
+	if _, ok := body["prompt"]; ok {
+		if _, v := body["video"]; v {
+			return "video"
+		}
+		return "image"
+	}
+	return "text"
 }
 
 // DefaultSettings 返回出厂设置。
@@ -399,6 +496,8 @@ func DefaultSettings() Settings {
 		UsageRequestLogBytes: 512,   // 日志「用户完整请求」保留字节上限
 		RateLimitRetryMax:     6,      // 429 网关内部自动重试次数上限（换账号+重新排队）
 		RateLimitWaitBudgetMS: 180000, // 429 内部重试总等待预算 3 分钟，超时才透传
+		// #26：上游 system 提示词策略，默认 forward（原样转发，零回归）。
+		SystemPromptPolicy: "forward",
 
 	}
 }
@@ -830,9 +929,29 @@ func normalizeSettings(v *Settings) {
 	if v.RateLimitWaitBudgetMS < 0 {
 		v.RateLimitWaitBudgetMS = d.RateLimitWaitBudgetMS
 	}
+	// #26：system_prompt_policy 只认白名单值，非法值回退 forward（零回归）；
+	// PrePrompts 缺省给空 map，避免 nil 带来的序列化/判空麻烦。
+	if !SystemPromptPolicyValues[v.SystemPromptPolicy] {
+		v.SystemPromptPolicy = "forward"
+	}
+	if v.PrePrompts == nil {
+		v.PrePrompts = map[string]string{}
+	}
 }
 
-// normalizeAccount 补齐缺失字段。
+// asString 把 any 安全转成字符串（config 包内通用工具）。
+func asString(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case fmt.Stringer:
+		return t.String()
+	case nil:
+		return ""
+	default:
+		return fmt.Sprintf("%v", t)
+	}
+}
 //
 // model_manifest 的语义：**缺失（nil）→ 用默认清单补齐**（视为「还没声明」）；
 // **非 nil 的空切片 → 保留为空**（视为「明示不支持该模态」）。

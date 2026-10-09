@@ -318,6 +318,11 @@ exit 0
 TRIVIAL = "#!/bin/bash\nexit 0\n"
 
 CHANGELOG = (
+    "1.0.19：新增「上游上下文策略（系统提示词）」——控制发给上游模型的 system 提示词如何处理，且【只动 system 内容，工具调用与思考能力始终保留】；"
+    "默认 forward（原样转发，零回归）；可选 仅剥离 system（最省 token）/ 覆盖为自定义提示词 / 按情景匹配前置提示词；"
+    "override 与 scenario 为空时回退内置「代码生成」默认提示词（面向在 WorkBuddy 上写代码优化）；控制台设置页新增对应卡片（模式下拉 + 自定义提示词框）；"
+    "用量日志「用户请求」列改为记录用户真正提交的原文（decision.Prompt.Text，已排除 system/assistant/tool 上下文，不再把整段系统提示词当作用户请求）；"
+    "修复 requestLog 截断阈值长期硬编码 8192、导致 UsageRequestLogBytes 配置项形同虚设的问题，现接入配置（默认 512）。"
     "1.0.18：修复控制台用量日志「查看请求」弹窗打不开的前端回归（点按钮弹窗不出现、控制台报 Uncaught ReferenceError: trunc is not defined）；"
     "根因为模板表达式误引用了未定义变量 trunc（应为 truncated），现已对齐；"
     "延续 v1.0.17：用量日志「用户请求」列改为只保留一个「查看请求」按钮（点击才弹完整请求原文）。"
