@@ -38,6 +38,15 @@
     border-radius:9px;background:#fff;color:var(--ink);width:100%}
   textarea{font-family:var(--mono);font-size:12px;min-height:90px;resize:vertical}
   label{font-size:12px;color:var(--muted);display:block;margin-bottom:4px}
+  /* 用量日志「用户请求」单元格悬停浮层：限宽、可换行、可滚动，替代渲染极差的原生 title */
+  .req-tip{position:absolute;z-index:60;max-width:560px;max-height:340px;overflow:auto;
+    white-space:pre-wrap;word-break:break-word;font:11px/1.5 var(--mono);color:var(--ink);
+    background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px 12px;
+    box-shadow:0 8px 28px rgba(0,0,0,.18);display:none}
+  .req-tip .req-tip-hd{font:600 11px var(--sans,system-ui);color:var(--muted);
+    margin-bottom:6px;white-space:nowrap}
+  .req-tip .req-tip-more{margin-top:8px;font:11px var(--sans,system-ui);color:var(--accent,#3b82f6);
+    cursor:pointer;white-space:nowrap}
   table{width:100%;border-collapse:collapse}
   th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
   th{font-size:12px;color:var(--muted);font-weight:600;background:#fafbfc}
@@ -643,7 +652,7 @@ function viewLogs(){
     <td>${esc(l.account||"")}</td>
     <td class="mono">${l.wait_ms!=null?Math.round(l.wait_ms)+"ms":""}</td>
     <td>${esc(l.phase||"")}</td>
-    <td class="mono" style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle"><span title="${esc(raw)}">${esc(raw.slice(0,80))||"（无）"}</span>${btn}</td></tr>`;}).join("");
+    <td class="req-cell mono" data-idx="${i}" style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle;cursor:help"><span>${esc(raw.slice(0,80))||"（无）"}</span>${btn}</td></tr>`;}).join("");
   return `<div class="card"><div class="spread"><h2>用量日志</h2>
       <div class="muted">含每次请求的意图判定依据（intent_by / intent_score / reason）与用户提出的完整请求；点「完整」查看原文全文</div></div>
     <div class="scroll"><table><thead><tr><th>时间</th><th>意图</th><th>模型</th><th>池</th><th>账号</th><th>等待</th><th>阶段</th><th>用户请求</th></tr></thead>
@@ -702,6 +711,46 @@ function fallbackCopy(text,done){
   document.body.removeChild(ta);
   done(ok); if(!ok && location && location.hostname!=="localhost"){ toast("复制失败，请手动全选 pre 内文本","bad"); }
 }
+
+/* ---------------- 用量日志「用户请求」悬停浮层 ---------------- */
+// 原生 title 对 8KB 多行 JSON 渲染极差（只显示一小段、不滚动、被截断）。
+// 用一个自定义浮层：限宽、可换行、可滚动，鼠标移到「用户请求」单元格即可看（几乎）全文。
+// 按序号从 state.logs 读全文（与「完整」按钮同口径），不内联进 HTML。
+let _reqTip=null;
+function reqTipEl(){
+  if(_reqTip) return _reqTip;
+  _reqTip = document.createElement("div");
+  _reqTip.className = "req-tip";
+  document.body.appendChild(_reqTip);
+  return _reqTip;
+}
+function showReqTip(cell){
+  const i = Number(cell.dataset.idx);
+  const l = (state.logs||[])[i];
+  const raw = (l && l.user_request)||"";
+  if(!raw.trim()){ return; } // 无请求则不弹浮层（列里已显示「（无）」）
+  const tip = reqTipEl();
+  const more = raw.length > 20000 ? `<div class="req-tip-more">已显示前 20000 字符，点「完整」看全文 / 复制 →</div>` : "";
+  tip.innerHTML = `<div class="req-tip-hd">用户提出的完整请求（${i}）</div><pre style="margin:0">${esc(raw.slice(0,20000))}</pre>${more}`;
+  const r = cell.getBoundingClientRect();
+  tip.style.left = Math.min(r.left, (window.innerWidth||1200)-580) + "px";
+  tip.style.top = (r.bottom + window.scrollY + 6) + "px";
+  tip.style.display = "block";
+}
+function hideReqTip(){ if(_reqTip) _reqTip.style.display = "none"; }
+// 事件委托（挂一次即可，30s 重渲染表格也不影响）：mouseenter/mouseleave 定位到具体单元格。
+function bindReqTipDelegation(){
+  if(_reqTipDelegated) return; _reqTipDelegated = true;
+  document.addEventListener("mouseover", e=>{
+    const cell = e.target.closest ? e.target.closest(".req-cell") : null;
+    if(cell) showReqTip(cell);
+  });
+  document.addEventListener("mouseout", e=>{
+    const cell = e.target.closest ? e.target.closest(".req-cell") : null;
+    if(cell) hideReqTip();
+  });
+}
+let _reqTipDelegated = false;
 
 // 把字符串安全地内联进 onclick 属性（JSON 字符串字面量）——备用工具。
 function escJSQuote(s){ return String(s).replace(/&/g,"\\u0026").replace(/'/g,"\\u0027").replace(/"/g,"\\u0022").replace(/`/g,"\\u0060"); }
@@ -1126,6 +1175,7 @@ async function boot(){
   await refresh();
 }
 window.addEventListener("DOMContentLoaded", async ()=>{
+  bindReqTipDelegation();
   try{
     const s = await api("/api/session");
     state.session = s;
