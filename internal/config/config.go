@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -298,9 +299,21 @@ type Settings struct {
 	RequestTimeoutMS     int                `json:"request_timeout_ms"` // 单个上游请求超时（ms），0=无限（不推荐）
 	// FreeTextRPM 是 agnes 免费档（access_type=free）文本池的标称 RPM，改为可配置项。
 	// 默认 10；填 0 或留空则回退默认值。per-account 的 rpm_overrides 仍然优先。
-	FreeTextRPM          float64            `json:"free_text_rpm"`
-	ChatPasswordHash     string             `json:"chat_password_hash,omitempty"`
-	ChatPasswordSalt     string             `json:"chat_password_salt,omitempty"`
+	FreeTextRPM          float64 `json:"free_text_rpm"`
+	// StreamIdleTimeoutMS 是流式（SSE）响应的「空闲看门狗」超时（ms）：
+	// 只要上游还在持续吐字节，计时就随数据重置，整条流不限时长；
+	// 仅当连续超过该时长【没有任何新字节】时才判定为卡死并断开。
+	// 非流式请求仍用 RequestTimeoutMS 的整请求墙钟超时，二者互不影响。
+	// 默认 60000；填 0 视为 60s。
+	StreamIdleTimeoutMS int    `json:"stream_idle_timeout_ms"`
+	// UsageLogMaxLines 是 usage.jsonl 保留的最大行数（按最近 N 行滚动截断，
+	// 防止长期挂机把磁盘写满）。默认 20000；填 0 表示不限。
+	UsageLogMaxLines int `json:"usage_log_max_lines"`
+	// UsageRequestLogBytes 是日志里「用户提出的完整请求」保留的最大字节数，
+	// 超过即截断（默认 512，排障够用且不撑爆日志）。
+	UsageRequestLogBytes int `json:"usage_request_log_bytes"`
+	ChatPasswordHash     string `json:"chat_password_hash,omitempty"`
+	ChatPasswordSalt     string `json:"chat_password_salt,omitempty"`
 }
 
 // DefaultSettings 返回出厂设置。
@@ -359,6 +372,9 @@ func DefaultSettings() Settings {
 		RegionPriority:      "cn_first",
 		RequestTimeoutMS:    30000, // 默认 30s 上游请求超时
 		FreeTextRPM:         10,    // agnes 免费档文本池标称 RPM（可配置）
+		StreamIdleTimeoutMS: 60000, // 流式空闲看门狗：连续 60s 无新字节才断开
+		UsageLogMaxLines:    20000,  // usage.jsonl 滚动保留最大行数
+		UsageRequestLogBytes: 512,   // 日志「用户完整请求」保留字节上限
 	}
 }
 
@@ -377,6 +393,9 @@ type Store struct {
 	Jobs      map[string]*VideoJob
 	ImageJobs map[string]*ImageJob
 	ChatLogs  map[string]*ChatLog
+	// usageLineCount 是 usage.jsonl 的累计行数（进程内估计，启动时从文件读一次，
+	// 之后按追加行数增长）。P1-1 用它触发滚动截断，避免长期挂机把磁盘写满。
+	usageLineCount atomic.Int64
 }
 
 // NewStore 载入（或初始化）data 目录。
@@ -455,6 +474,9 @@ func (s *Store) load() error {
 	for _, a := range s.Accounts {
 		normalizeAccount(a, s.Settings)
 	}
+	// P1-1：启动时从现有 usage.jsonl 读一次行数作为累计基线，
+	// 之后每次追加递增；超过阈值时滚动截断，防止挂机写满磁盘。
+	s.usageLineCount.Store(countLines(s.path("usage.jsonl")))
 	return nil
 }
 
@@ -555,6 +577,17 @@ func normalizeSettings(v *Settings) {
 	}
 	if v.FreeTextRPM <= 0 {
 		v.FreeTextRPM = d.FreeTextRPM
+	}
+	if v.StreamIdleTimeoutMS <= 0 {
+		v.StreamIdleTimeoutMS = d.StreamIdleTimeoutMS
+	}
+	// UsageLogMaxLines：0 视为「沿用默认 20000」（旧配置文件缺该字段时反序列化为 0）；
+	// 只有显式负值才表示「不限制」。默认取向是挂机安全——总是带上限，避免写满磁盘。
+	if v.UsageLogMaxLines == 0 {
+		v.UsageLogMaxLines = d.UsageLogMaxLines
+	}
+	if v.UsageRequestLogBytes <= 0 {
+		v.UsageRequestLogBytes = d.UsageRequestLogBytes
 	}
 }
 
@@ -1318,6 +1351,8 @@ func (s *Store) saveChatLogsLocked() error { return writeJSON(s.path("chat_logs.
 // ---- 用量日志 ----
 
 // AppendUsage 追加一行 JSONL（失败不影响主链路）。
+// P1-1：同时维护 usageLineCount，超过 UsageLogMaxLines 时滚动截断，
+// 防止 7×24 挂机把磁盘写满。
 func (s *Store) AppendUsage(record map[string]any) {
 	buf, err := json.Marshal(record)
 	if err != nil {
@@ -1327,8 +1362,50 @@ func (s *Store) AppendUsage(record map[string]any) {
 	if err != nil {
 		return
 	}
-	defer f.Close()
 	_, _ = f.Write(append(buf, '\n'))
+	_ = f.Close()
+
+	n := s.usageLineCount.Add(1)
+	maxLines := s.Settings.UsageLogMaxLines
+	if maxLines <= 0 {
+		return
+	}
+	// 只在计数精确达到 maxLines 的整数倍时截断（避免每次追加都扫一遍文件）。
+	if n%int64(maxLines) == 0 {
+		s.truncateUsageLog(maxLines)
+	}
+}
+
+// truncateUsageLog 把 usage.jsonl 截断为最近 keep 行，并更新计数。
+func (s *Store) truncateUsageLog(keep int) {
+	path := s.path("usage.jsonl")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	lines := strings.Split(string(data), "\n")
+	if len(lines) > keep {
+		lines = lines[len(lines)-keep:]
+	}
+	out := strings.TrimRight(strings.Join(lines, "\n"), "\n")
+	if out != "" {
+		out += "\n"
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(out), 0o644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, path)
+	s.usageLineCount.Store(countLines(path))
+}
+
+// countLines 统计文件的换行数（作为行数的近似基线）。
+func countLines(path string) int64 {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	return int64(strings.Count(string(data), "\n"))
 }
 
 // TailUsage 读取最近 n 条日志（倒序）。

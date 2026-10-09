@@ -22,6 +22,7 @@ import (
 	"math/rand"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"agneshub/internal/config"
@@ -49,10 +50,33 @@ var hopByHop = map[string]bool{
 //
 // 不设 Client.Timeout（视频任务提交后响应可能很慢），改为由 ctx 控制；
 // http.Client 的原生流式能力让我们无需缓冲即可透传 SSE。
+// 账号数未知时用默认连接池（向后兼容测试 / 旧调用）。
 func BuildClient() *http.Client {
+	return BuildClientForAccounts(0)
+}
+
+// BuildClientForAccounts 按当前账号数自适应连接池（P2-3）。
+//
+// 每个账号通常指向独立的上游 host，连接池 idle 上限按账号数线性放宽，
+// 避免多账号并发时 idle 连接被回收重建（TLS 握手成本）；单 host 上限
+// 保底 60（与历史默认一致），账号数越多总 idle 池越大。
+func BuildClientForAccounts(accountCount int) *http.Client {
+	if accountCount < 0 {
+		accountCount = 0
+	}
+	// 总 idle 池：历史默认 200，随账号数放宽（每账号 8 路），下限 200。
+	maxIdle := 200
+	if need := accountCount * 8; need > maxIdle {
+		maxIdle = need
+	}
+	// 单 host idle：保底 60；账号共用同一 base_url 的场景下随账号数再加。
+	maxIdlePerHost := 60
+	if need := accountCount; need > 60 {
+		maxIdlePerHost = 60 + (need-60)/4 // 多账号共 host 时温和放宽
+	}
 	transport := &http.Transport{
-		MaxIdleConns:        200,
-		MaxIdleConnsPerHost: 60,
+		MaxIdleConns:        maxIdle,
+		MaxIdleConnsPerHost: maxIdlePerHost,
 		IdleConnTimeout:     90 * time.Second,
 		ForceAttemptHTTP2:   true,
 	}
@@ -157,6 +181,11 @@ type Options struct {
 	// Idempotent 声明该请求可否安全重试。GET 轮询与纯文本对话为 true，
 	// 生图 / 视频提交为 false（重试会造成重复扣费与重复建任务）。
 	Idempotent bool
+	// Stream 标记这是一次流式（SSE）请求。为 true 时，请求超时时钟改由
+	// 「空闲看门狗」驱动（只要上游还在持续吐字节就不断开，仅在连续
+	// StreamIdleTimeoutMS 无任何新字节时才断开），避免长文本回答被固定的
+	// 整请求墙钟超时中途掐断。非流式请求忽略此字段，仍走 RequestTimeoutMS。
+	Stream bool
 }
 
 // Result 是一次转发的产物。
@@ -285,16 +314,34 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 
 	url := UpstreamURL(account, opts.Path)
 
-	// P0: 请求超时保护。为本次请求创建带超时的子 context，防止上游 hang 住耗尽连接池。
+	// P0: 请求超时保护。
+	//   - 非流式：整请求墙钟超时（RequestTimeoutMS），上游 hang 住会耗尽连接池，必须限时；
+	//   - 流式：改为「空闲看门狗」——从请求发起起计时，只要 StreamIdleTimeoutMS 内没有
+	//     任何新字节（含首字节）就断开；持续吐字则不断开。避免长文本回答被固定 30s
+	//     墙钟超时在途掐断（这是挂机场景下「任务不断流」的关键）。
 	s := h.Settings()
 	timeoutMS := s.RequestTimeoutMS
 	if timeoutMS <= 0 {
 		timeoutMS = 30000 // 默认 30s
 	}
-	reqCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMS)*time.Millisecond)
+	idleMS := s.StreamIdleTimeoutMS
+	if idleMS <= 0 {
+		idleMS = 60000 // 默认 60s 空闲才断开
+	}
+
+	var (
+		reqCtx context.Context
+		cancel context.CancelFunc
+	)
+	if opts.Stream {
+		reqCtx, cancel = context.WithCancel(ctx)
+	} else {
+		reqCtx, cancel = context.WithTimeout(ctx, time.Duration(timeoutMS)*time.Millisecond)
+	}
 
 	req, err := http.NewRequestWithContext(reqCtx, opts.Method, url, bytes.NewReader(body))
 	if err != nil {
+		cancel() // P2：request 构造失败时也取消 context，避免泄漏（vet 提示）。
 		return nil, false, err
 	}
 	for k, values := range ClientHeaders(account, opts.ExtraHeaders, opts.Anthropic) {
@@ -306,12 +353,24 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	select {
 	case sem <- struct{}{}:
 	case <-ctx.Done():
+		cancel() // 取消请求 context（ctx 已被外部取消，显式释放派生 context 避免泄漏）
 		return nil, false, ctx.Err()
+	}
+
+	// 流式请求：启动空闲看门狗（覆盖首字节等待）。client.Do 阻塞在响应头阶段，
+	// 若上游迟迟不回响应头 / 连接建立后无数据，看门狗会在 idleMS 后 cancel 断开。
+	var wd *streamWatchdog
+	if opts.Stream {
+		wd = newStreamWatchdog(cancel, time.Duration(idleMS)*time.Millisecond)
+		wd.arm()
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
 		<-sem
+		if wd != nil {
+			wd.stop()
+		}
 		cancel()
 		h.NoteError(account, fmt.Sprintf("%T: %v", err, err))
 		h.Metrics.RequestsError.Add(1)
@@ -324,11 +383,18 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	}
 
 	status := resp.StatusCode
+	if wd != nil {
+		// 响应头已到达：重置空闲计时，进入「流式体」阶段继续看门狗。
+		wd.arm()
+	}
 
 	if status == 402 {
 		// 402 Payment Required：额度耗尽，不熔断（等待复活即可），但记录错误不重试
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
+		if wd != nil {
+			wd.stop()
+		}
 		<-sem
 		cancel()
 		h.NoteError(account, fmt.Sprintf("HTTP %d: %s", status, string(raw)))
@@ -342,6 +408,9 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	if AuthFailStatus[status] { // 401 / 403
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
+		if wd != nil {
+			wd.stop()
+		}
 		<-sem
 		cancel()
 		h.OnAuthFailure(account, fmt.Sprintf("HTTP %d: %s", status, string(raw)))
@@ -354,6 +423,9 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	if status == http.StatusTooManyRequests {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
+		if wd != nil {
+			wd.stop()
+		}
 		<-sem
 		cancel()
 		h.OnRateLimited(account, opts.PoolClass)
@@ -366,6 +438,9 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	if RetryableStatus[status] {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 		resp.Body.Close()
+		if wd != nil {
+			wd.stop()
+		}
 		<-sem
 		cancel()
 		h.NoteError(account, fmt.Sprintf("HTTP %d: %s", status, string(raw)))
@@ -379,7 +454,13 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	// 注意：成功路径【绝不】在此提前关闭 body 或取消 reqCtx，否则调用方读取 body 时
 	// 连接已关闭 / context 已取消，会读到空体（表现为网关回 {}）。
 	// 直到调用方读完 body 触发 Close()，才在此 release 里 cancel()。
-	wrapped := &releaseOnClose{ReadCloser: resp.Body, release: func() {
+	var streamBody io.ReadCloser = resp.Body
+	if opts.Stream {
+		// 流式：body 上套 idleStreamBody（读到字节就 wd.arm() 重置看门狗），
+		// 与前面 client.Do 阶段启动的看门狗衔接，连续 idleMS 无任何字节才断开。
+		streamBody = &idleStreamBody{ReadCloser: resp.Body, wd: wd}
+	}
+	wrapped := &releaseOnClose{ReadCloser: streamBody, release: func() {
 		cancel() // body 读取完毕后才取消 context
 		select {
 		case <-sem:
@@ -405,6 +486,72 @@ func (s *releaseOnClose) Close() error {
 		s.release()
 	}
 	return err
+}
+
+// streamWatchdog 是流式请求的「空闲看门狗」：从请求发起起计时，只要 interval 内没有
+// 任何字节（包括首字节/响应头迟迟未到）就调用 cancel 断开上游；arm() 在「有字节到达」
+// 时重置计时。它是挂机场景下「长回答不断流」的关键——非流式请求用固定墙钟超时，
+// 流式请求改用它：上游只要还在正常吐字，整条 SSE 流可持续任意久，不会被 30s 墙钟在途掐断。
+type streamWatchdog struct {
+	cancel   context.CancelFunc
+	interval time.Duration
+	mu       sync.Mutex
+	timer    *time.Timer
+	stopped  bool
+}
+
+func newStreamWatchdog(cancel context.CancelFunc, interval time.Duration) *streamWatchdog {
+	if interval <= 0 {
+		interval = 60 * time.Second
+	}
+	return &streamWatchdog{cancel: cancel, interval: interval}
+}
+
+// arm 启动或重置一次空闲计时（从此刻起 interval 内无事件则 cancel）。
+func (g *streamWatchdog) arm() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.stopped {
+		return
+	}
+	if g.timer != nil {
+		g.timer.Stop()
+	}
+	g.timer = time.AfterFunc(g.interval, g.cancel)
+}
+
+// stop 永久停止看门狗（请求结束 / 出错时）。幂等。
+func (g *streamWatchdog) stop() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.stopped {
+		return
+	}
+	g.stopped = true
+	if g.timer != nil {
+		g.timer.Stop()
+	}
+}
+
+// idleStreamBody 把「读到字节就重置看门狗」包进 io.ReadCloser，交给 releaseOnClose。
+type idleStreamBody struct {
+	io.ReadCloser
+	wd *streamWatchdog
+}
+
+func (s *idleStreamBody) Read(p []byte) (int, error) {
+	n, err := s.ReadCloser.Read(p)
+	if n > 0 {
+		s.wd.arm()
+	}
+	return n, err
+}
+
+func (s *idleStreamBody) Close() error {
+	if s.wd != nil {
+		s.wd.stop()
+	}
+	return s.ReadCloser.Close()
 }
 
 func sleepBackoff(ctx context.Context, s config.Settings, attempt int) {

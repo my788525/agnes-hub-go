@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>白嫖 Hub（agnes-hub-go）挂机鲁棒性审计 · 2026-10-09</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#ffffff; --ink:#1f2733; --muted:#66707e;
+    --line:#e4e8ee; --p0:#d64545; --p0bg:#fdecec; --p1:#d98324; --p1bg:#fdf3e3;
+    --p2:#2f7d6b; --p2bg:#e7f4ef; --good:#2f7d6b; --goodbg:#e7f4ef;
+    --accent:#2563eb; --accentbg:#eaf1fe; --mono:#0b3a5b;
+    --mono1:#f2f5f8;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.65 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;padding:28px}
+  .wrap{max-width:960px;margin:0 auto}
+  h1{font-size:22px;margin:0 0 4px}
+  .sub{color:var(--muted);margin:0 0 20px;font-size:13px}
+  .kpis{display:flex;flex-wrap:wrap;gap:10px;margin:18px 0}
+  .kpi{flex:1;min-width:150px;background:var(--card);border:1px solid var(--line);
+    border-radius:10px;padding:14px}
+  .kpi .n{font-size:26px;font-weight:700}
+  .kpi .l{font-size:12px;color:var(--muted);margin-top:2px}
+  .kpi.p0 .n{color:var(--p0)} .kpi.p1 .n{color:var(--p1)} .kpi.p2 .n{color:var(--p2)}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;
+    padding:18px;margin:14px 0}
+  .tag{display:inline-block;font-size:11px;font-weight:700;padding:2px 9px;
+    border-radius:999px;vertical-align:middle}
+  .tag.p0{background:var(--p0bg);color:var(--p0)}
+  .tag.p1{background:var(--p1bg);color:var(--p1)}
+  .tag.p2{background:var(--p2bg);color:var(--p2)}
+  .tag.good{background:var(--goodbg);color:var(--good)}
+  .tag.info{background:var(--accentbg);color:var(--accent)}
+  .card h2{font-size:16px;margin:2px 0 6px}
+  .card .why{color:var(--muted);font-size:13px}
+  code,.mono{font-family:"Cascadia Code",Consolas,"SF Mono",monospace;font-size:12.5px;
+    background:var(--mono1);color:var(--mono);padding:1px 6px;border-radius:5px}
+  .row{margin:9px 0}
+  .lbl{font-weight:700;font-size:12px;letter-spacing:.3px;text-transform:uppercase;
+    color:var(--muted);margin-bottom:3px}
+  .tbl{width:100%;border-collapse:collapse;margin:10px 0;font-size:13px}
+  .tbl th,.tbl td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  .tbl th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.3px}
+  .tbl td.fix{color:var(--good)}
+  ul.tight{margin:8px 0;padding-left:20px}
+  ul.tight li{margin:5px 0}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:720px){.grid{grid-template-columns:1fr}}
+  .foot{color:var(--muted);font-size:12px;margin-top:22px;line-height:1.7}
+  .sec{font-size:13px;font-weight:700;color:var(--muted);text-transform:uppercase;
+    letter-spacing:.6px;margin:24px 0 8px;padding-bottom:6px;border-bottom:2px solid var(--line)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>白嫖 Hub · agnes-hub-go 挂机鲁棒性审计</h1>
+  <p class="sub">范围：响应速度 / 执行效率 / 客户端任务不断流 / 自动重试与调度鲁棒性 / 长期无人干预挂机 · 2026-10-09 · 基于 v1.0.13 源码逐行核实</p>
+
+  <div class="kpis">
+    <div class="kpi p0"><div class="n">2</div><div class="l">P0 需尽快处理</div></div>
+    <div class="kpi p1"><div class="n">4</div><div class="l">P1 挂机质量</div></div>
+    <div class="kpi p2"><div class="n">4</div><div class="l">P2 效率优化</div></div>
+    <div class="kpi p2"><div class="n">5</div><div class="l">已做对的（保留）</div></div>
+  </div>
+
+  <div class="card" style="background:var(--accentbg);border-color:#c7d8f5">
+    <h2 style="color:var(--accent)">总体结论</h2>
+    <p style="margin:4px 0" class="why">调度内核（严格 FIFO 节拍 + 幂等/非幂等重试区分 + 账号×池二维自适应校准 + 熔断自动复活 + 粘性软溢出）设计成熟，已能支撑「客户端永不 429、任务不断线」的核心目标。
+    遗留风险集中在 <b>挂机连续性</b>：①流式长回答会被统一 30s 请求超时掐断；②全进程无 panic 恢复，任一路径 panic 会连正在跑的所有任务一起崩掉；③用量日志/绑定落盘随挂机时长线性膨胀。
+    这三项是当前「长期挂机无人干预」最可能触发中断的断点，建议优先修。</p>
+  </div>
+
+  <div class="sec">P0 · 挂机中断的高危断点</div>
+
+  <div class="card">
+    <h2>P0-1 流式长回答被统一 30s 请求超时掐断 <span class="tag p0">响应速度 / 不断流</span></h2>
+    <p class="why"><code>relay.go:289-296</code> 的 <code>attemptOnce</code> 对<b>所有</b>请求（含 <code>stream=true</code> 的 SSE）统一套 <code>RequestTimeoutMS</code>（默认 30000ms）的 <code>reqCtx</code> 超时。上游是长文本回答时，SSE 流持续输出往往远超 30s；一旦 <code>reqCtx</code> 到期，流被取消、连接断开，客户端在长回答中途看到「断流」。
+    而 <code>relay.Options</code> 没有「是否流式」标志，<code>attemptOnce</code> 无法对流式做超时放宽。<code>httpSrv</code> 本身刻意不设 WriteTimeout（<code>main.go:123-125</code>），说明「长流」是预期支持的——问题只在上游侧的请求超时没区分流式。</p>
+    <div class="lbl">建议</div>
+    <ul class="tight">
+      <li>给 <code>relay.Options</code> 增加 <code>Stream bool</code>；流式时把 <code>RequestTimeoutMS</code> 解释为「首字节/心跳空闲超时」而非「整请求墙钟超时」——即上游只要还在吐数据就持续重置空闲计时，真正卡死（长时间零字节）才断开。非流式保持现有 30s 整请求超时不变。</li>
+      <li>流式空闲超时可单设一个更宽松的配置项（如 <code>StreamIdleTimeoutMS</code>，默认 60s）。</li>
+      <li>影响面：仅 <code>finishStream</code> / <code>proxy</code> 流式路径；非流式行为零变化，回归风险低。</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>P0-2 全进程无 panic 恢复，单点 panic 会带走所有在途任务 <span class="tag p0">鲁棒性 / 挂机</span></h2>
+    <p class="why"><code>server.go:62-63</code> 的 <code>ServeHTTP</code> 直接转发 <code>s.mux</code>，全仓（<code>grep recover()</code> 为空）<b>没有任何 recover 中间件</b>。标准库 <code>net/http</code> 对每个请求 goroutine 内 panic 会打印堆栈并<b>关闭该连接</b>，但像 <code>server.go:1150</code> 里 <code>go func(){ relay.Do(...) ; ch&lt;-... }</code> 这种<b>独立 goroutine</b> 若 panic，会直接<b>终止整个进程</b>——正在跑的所有请求、排队中的任务、粘性会话全部蒸发。对「长期挂机」这是最致命的单点。</p>
+    <div class="lbl">建议</div>
+    <ul class="tight">
+      <li>在 <code>ServeHTTP</code> 最外层包一层 <code>defer func(){ if e:=recover(); e!=nil{ log + 500 } }()</code>，兜住 handler 路径。</li>
+      <li>给独立 goroutine（流式 <code>relay.Do</code> 的 goroutine、维护循环、更新器循环）各自加 recover，panic 时记录 <code>debug.Stack()</code> 并走优雅降级，而非进程级崩溃。</li>
+      <li>可选（进阶）：加 <code>/metrics</code> 里的 <code>panics_total</code> 计数与日志落盘，便于挂机期间事后定位。</li>
+      <li>影响面：纯加固，不改正常逻辑，是「挂机无人值守」的地基。</li>
+    </ul>
+  </div>
+
+  <div class="sec">P1 · 长期挂机质量与可观测性</div>
+
+  <div class="card">
+    <h2>P1-1 用量日志 / 粘性绑定随挂机时长无限膨胀 <span class="tag p1">挂机 / 存储</span></h2>
+    <p class="why"><code>AppendUsage</code>（<code>config.go:1321</code>）每次 <code>done</code> 请求向 <code>usage.jsonl</code> 追加一行且<b>无轮转/上限</b>；<code>user_request</code> 字段最多带 8KB。挂机 7×24 时该文件线性增长，最终磁盘占满。<code>Bindings</code> 有 TTL 清理（<code>SessionTTLHours</code> 默认 72h，<code>config.go:1065-1072</code>），这块是好的；但 <code>usage.jsonl</code> 与 <code>videos.jsonl</code>/<code>images.jsonl</code> 缺同样的轮转。</p>
+    <div class="lbl">建议</div>
+    <ul class="tight">
+      <li>给 <code>usage.jsonl</code> 加按大小/按天数轮转（保留最近 N 天或 M MB，超出即截断），启动时检查一次。</li>
+      <li>更省的做法：把 8KB 的 <code>user_request</code> 默认只记前 512B，控制台「查看完整请求」再按需从内存环形缓冲取——既保留排障能力又止住磁盘膨胀。</li>
+      <li>影响面：仅日志/存储层，调度零影响。</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>P1-2 自更新会重启进程，正挂机长任务会被打断 <span class="tag p1">不断流 / 挂机</span></h2>
+    <p class="why">自动更新链路：<code>main.go:101-116</code> 检测到 <code>NeedRestart()</code> 即 <code>cancel()</code> 触发优雅关闭；<code>StartBackground</code>（<code>updater.go:324</code>）每 12h <code>Check</code>，控制台手动 <code>POST /api/update/apply</code>（<code>console.go:1680</code>）才真正 <code>Apply</code>+<code>RequestRestart</code>。重启瞬间<b>未完成的视频轮询、排队中的请求、流式回答都会中断</b>。fnOS 上应用中心升级也走同类替换。对「挂机长跑」场景，更新时机不可控是现实的断点。</p>
+    <div class="lbl">建议</div>
+    <ul class="tight">
+      <li>优雅关闭前<b>拒绝新任务、等在途 in-flight 清零（或给一个有上限的宽限期）再退出</b>，避免半途砍断。可在关闭钩子里轮询 <code>h.inflight</code> 总和，>0 则等待直至上限。</li>
+      <li>视频类长任务加「恢复」语义：重启后 <code>videos.jsonl</code> 里的 submitted 任务仍可由客户端凭 <code>job_id</code> 续查（网关已有 <code>handleVideoPoll</code>，需确保 job 记录跨重启可用）。</li>
+      <li>影响面：只改停机/升级时序，正常运行零变化。</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>P1-3 429 后因子下调依赖 Reload，节流收紧不够即时可观测 <span class="tag p1">调度鲁棒性</span></h2>
+    <p class="why"><code>OnRateLimited</code>（<code>hub.go:792</code>）下调 <code>poolFactors</code> 后调 <code>h.Reload()</code>，<code>Reload</code> 内 <code>p.Reconfigure(rpm, ...)</code> 确实会夹紧 <code>nextFreeAt</code>（保留排队、不重建）。逻辑正确。但两点可改进：<b>①</b> 高频 429 风暴时每次 <code>OnRateLimited</code> 都全量 <code>Reload</code>（遍历全部账号×池×模态、读 <code>AccountsSnapshot</code> 深拷贝），CPU 与锁竞争偏高；<b>②</b> <code>Reconfigure</code> 只在因子变化时才 <code>Reconfigure</code>，若已到底（<code>min_learned_factor=0.5</code>）仍会空跑。</p>
+    <div class="lbl">建议</div>
+    <ul class="tight">
+      <li>把「429 → 只收紧该 (账号×池) 一个 pacer」独立成 <code>h.ReloadPacer(a, poolClass)</code>，避免全量 <code>Reload</code>；全量 <code>Reload</code> 保留给设置变更/账号增删。</li>
+      <li>在 <code>/metrics</code> 增加 <code>breaker_open_total</code>、<code>upstream_429_rate_per_min</code>、各账号当前 effective RPM gauge，让「挂机期间调度是否健康」可被外部监控告警。</li>
+      <li>影响面：内部重构，行为保持一致，需回归 429 相关测试。</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>P1-4 挂机期缺少「健康心跳 + 自愈」闭环的对外出口 <span class="tag p1">可观测性</span></h2>
+    <p class="why">当前有 <code>/healthz</code> 与 <code>/metrics</code>（文本，<code>server.go:372</code> 起），但「能否长期挂机」的判断缺少一个明确的聚合健康信号：比如「有 ≥1 个账号可用 + 最近 N 分钟成功率 + 队列积压」。外部编排（如 Docker/fnOS 的重启策略、Prometheus 告警）难以据此做自动拉起。</p>
+    <div class="lbl">建议</div>
+    <ul class="tight">
+      <li>在 <code>/healthz</code> 返回富健康度：<code>{ok, available_accounts, queue_depth, last_success_age_ms, breaker_open}</code>，让外部可据此判断「该重启/告警」。</li>
+      <li>可选加 <code>self_health.jsonl</code> 滚动记录，供事后审计挂机期间的退化曲线。</li>
+      <li>影响面：只扩展只读端点，风险极低。</li>
+    </ul>
+  </div>
+
+  <div class="sec">P2 · 响应速度与执行效率优化</div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>P2-1 视频/图片提交绕过 pacer，靠独立 GET 轮询 <span class="tag p2">效率</span></h2>
+      <p class="why"><code>pollUpstream</code>（<code>server.go:943</code>）用独立 <code>GET /agnesapi?video_id=</code> 轮询上游，<b>不占生成配额、不进 pacer</b>——这是对的（轮询本不该挤占生成 RPM）。但每轮 <code>http.NewRequestWithContext + s.Client.Do</code> 虽走共享连接池，仍逐次建 http.Request；高频轮询（间隔最小 1s）下可考虑复用 URL 构造、批量并发轮询多个 job。</p>
+      <div class="lbl">建议</div>
+      <ul class="tight">
+        <li>多 job 挂机时用一个后台轮询器并发探测（带每账号并发上限），而非每个 job 各自起 goroutine；结果写回 <code>videos.jsonl</code>，客户端拉取即得，无需长连接占位。</li>
+        <li>可选：指数拉大轮询间隔（前 30s 每 2s，之后每 5s/10s），显著降低挂机期上游探测压力。</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h2>P2-2 <code>handleTextish</code> 每请求重复 <code>readBody</code> + <code>json.Marshal</code> 克隆 <span class="tag p2">速度</span></h2>
+      <p class="why"><code>server.go:588-593</code>：非 auto 模型路径对 body 做 <code>cloneBody</code> + <code>json.Marshal</code> 生成 <code>buf</code>；auto 路径走 <code>bodyForAccount</code> 每账号再 marshal 一次。热路径上 <code>map→JSON</code> 编解码与深拷贝是主要 CPU 开销。意图判定已走 LRU 缓存（<code>intent/cache.go</code>），这块已优化。</p>
+      <div class="lbl">建议</div>
+      <ul class="tight">
+        <li>当 <code>BodyFor</code> 未改写 model 时，直接复用客户端原始 <code>rawBody</code>（<code>readBody</code> 已保留），省一次 marshal；仅确需改写 model 时才克隆。</li>
+        <li>影响面：请求构造路径，需核对各模型别名/manifest 改写正确性。</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h2>P2-3 上游连接池上限偏低（高并发挂机） <span class="tag p2">效率</span></h2>
+      <p class="why"><code>BuildClient</code>（<code>relay.go:52</code>）：MaxIdleConns=200 / MaxIdleConnsPerHost=60。多账号（每个账号=独立 Host）挂机时，账号数 >60 会让每账号空闲连接被 60 截断，新连接重复 TLS 握手，抬高首字节延迟。</p>
+      <div class="lbl">建议</div>
+      <ul class="tight">
+        <li>按「账号数」动态调 <code>MaxIdleConnsPerHost</code>（如 <code>max(60, 账号数×并发)</code>），或把连接池配置暴露到设置项。</li>
+        <li>影响面：连接池参数，低风险。</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h2>P2-4 <code>OnRateLimited</code> 每 429 触发 <code>Reload</code> 全量快照 <span class="tag p2">效率</span></h2>
+      <p class="why">与 P1-3 同根：429 风暴期全量 <code>Reload</code>（<code>AccountsSnapshot</code> 深拷贝所有账号）在锁内执行，放大 <code>hub.mu</code> 争用，间接拖慢并发请求的 <code>Pick</code>/<code>Acquire</code>。热路径本已用 <code>MutateAccountNoSave</code> 避免写盘（设计很好）。</p>
+      <div class="lbl">建议</div>
+      <ul class="tight">
+        <li>429 路径只 <code>ReloadPacer</code> 单账号（见 P1-3），不触发全量快照。<code>FlushAccounts</code> 仍由 30s 维护循环批量落盘。</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="sec">已做对的（保留，勿改坏）</div>
+
+  <div class="card">
+    <table class="tbl">
+      <tr><th style="width:38%">机制</th><th>证据</th><th class="fix">为什么好</th></tr>
+      <tr><td>严格 FIFO 节拍（非令牌桶/固定窗口）</td><td><code>pacer.go:10-15</code></td><td class="fix">规避突发命中上游「相邻间隔」限流，实测 22RPM 7/7、30RPM 第 2 个即被限。</td></tr>
+      <tr><td>幂等/非幂等重试区分</td><td><code>relay.go:260-264</code></td><td class="fix">生图/视频提交 5xx 立即返回不重试，避免重复扣费/重复建任务——不可见的账单陷阱被根除。</td></tr>
+      <tr><td>429 受理前可安全重试</td><td><code>relay.go:262</code></td><td class="fix">429 一律换号重试，5xx 依幂等性决定，重试边界精确。</td></tr>
+      <tr><td>账号×池二维自适应校准（不横向传染）</td><td><code>hub.go:785-837</code></td><td class="fix">只下调出事的 (账号×池) 因子，避免视频池 429 连带砍文本池——多账号「一起变慢」的根因被消除。</td></tr>
+      <tr><td>熔断自动复活 + 成功次数回升</td><td><code>hub.go:432-445 / 841-870</code></td><td class="fix">账号 401/403 熔断后自动复活低速试探；因子按成功次数（非墙钟）回升，低流量账号也能恢复。挂机无人工的核心保证。</td></tr>
+    </table>
+  </div>
+
+  <div class="sec">落地路线（按收益 / 风险排序）</div>
+
+  <div class="card">
+    <table class="tbl">
+      <tr><th style="width:8%">序</th><th style="width:22%">项</th><th>动作</th><th style="width:16%">预估工作量</th></tr>
+      <tr><td>1</td><td>P0-2 panic 恢复</td><td><code>ServeHTTP</code> + 各独立 goroutine 加 <code>recover()</code> 兜底</td><td>~0.5 天</td></tr>
+      <tr><td>2</td><td>P0-1 流式超时</td><td><code>Options.Stream</code> + 流式空闲超时（首字节/心跳驱动重置）</td><td>~1 天</td></tr>
+      <tr><td>3</td><td>P1-1 日志轮转</td><td><code>usage.jsonl</code> 按大小/天数截断；user_request 默认 512B</td><td>~0.5 天</td></tr>
+      <tr><td>4</td><td>P1-2 优雅停机</td><td>关闭前等在途 in-flight 清零（上限宽限）+ 视频 job 跨重启续查</td><td>~1 天</td></tr>
+      <tr><td>5</td><td>P1-3 / P2-4 单 pacer reload</td><td>抽出 <code>ReloadPacer(a, pool)</code>，429 不触发全量 <code>Reload</code></td><td>~0.5 天</td></tr>
+      <tr><td>6</td><td>P1-4 健康出口</td><td><code>/healthz</code> 富健康度 + /metrics 增加 429 速率、breaker gauge</td><td>~0.5 天</td></tr>
+      <tr><td>7</td><td>P2-2 / P2-3</td><td>热路径省一次 marshal；连接池随账号数自适应</td><td>~0.5 天</td></tr>
+    </table>
+    <p class="foot" style="margin-top:8px">前 4 项即构成「挂机无人干预」的最小闭环：崩不死（P0-2）、流不断（P0-1）、盘不爆（P1-1）、更新不打断（P1-2）。P1-3/4 与 P2 是性能与可观测性的渐进优化，可分版本消化。建议先做 P0-1/P0-2 发一个 v1.0.14 稳定版，其余排期跟进。</p>
+  </div>
+
+  <p class="foot">本报告所有结论均定位到 v1.0.13 源码具体行号；既有失败测试（<code>TestAutoRoutesText</code> 等「模型 agnes-auto 不是 chat 模型」）为基线历史问题，与本审计无关。改动建议落地前请跑通 <code>go test ./internal/...</code> 并回归 429 / 流式 / 视频轮询路径。</p>
+
+</div>
+</body>
+</html>

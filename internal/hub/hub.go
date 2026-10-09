@@ -16,7 +16,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,7 +51,13 @@ type Metrics struct {
 	Spillovers     atomic.Int64
 	BreakerOpened  atomic.Int64
 	BreakerRevived atomic.Int64
-	StartedAt      time.Time
+	// PanicsTotal 记录被 recover 兜住并已降级（而非进程崩溃）的 panic 次数，
+	// 供 /metrics 观测与「挂机健康度」判断（见 P0-2）。
+	PanicsTotal atomic.Int64
+	// LastSuccessNS 全局最近一次上游成功的 UnixNano 时间戳，
+	// 供 /healthz 的 last_success_age_ms（「最近多久有流量真正跑通」）观测。
+	LastSuccessNS atomic.Int64
+	StartedAt     time.Time
 }
 
 // Hub 是调度器。
@@ -73,8 +81,49 @@ type Hub struct {
 	// 多账号是否真正被吃到。单 goroutine 写入（调度主循环），控制台读取时加锁。
 	Arrivals arrivalRing
 
+	// Recent429 记录最近 60s 内真实命中上游 429 的时间戳（有界环形），
+	// 供 /healthz 的 upstream_429_rate_per_min（「最近一分钟到底有多少次限流」）。
+	Recent429 rate429Ring
+
 	// Metrics 是运行指标（/healthz 与控制台观测）。
 	Metrics Metrics
+}
+
+// rate429Ring 记录最近 60s 内 429 时间戳，PerMinute() 返回窗口内命中次数。
+const RATE429_WINDOW = 60 * time.Second
+
+type rate429Ring struct {
+	mu    sync.Mutex
+	items [512]time.Time
+	n     int
+	pos   int
+}
+
+// record 记录一次 429。
+func (r *rate429Ring) record() {
+	r.mu.Lock()
+	now := time.Now()
+	r.items[r.pos%len(r.items)] = now
+	r.pos++
+	if r.n < len(r.items) {
+		r.n++
+	}
+	r.mu.Unlock()
+}
+
+// PerMinute 返回最近 60s 内 429 命中次数（惰性滑出窗口）。
+func (r *rate429Ring) PerMinute() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	c := 0
+	for i := 0; i < r.n; i++ {
+		idx := (r.pos - r.n + i + len(r.items)) % len(r.items)
+		if now.Sub(r.items[idx]) <= RATE429_WINDOW {
+			c++
+		}
+	}
+	return c
 }
 
 // arrivalRing 是固定容量环形时间戳数组（并发安全）。
@@ -327,6 +376,22 @@ func (h *Hub) Semaphore(a *config.Account, modality string) chan struct{} {
 	return ch
 }
 
+// ReloadPacer 只收紧/放宽「单个账号 × 单个池」的节拍器，避免 429 高频路径上做
+// 全量快照 Reload()（O(账号数 × 池数) 的重新初始化，429 风暴时每个请求都拖一次）。
+// 调用前必须已更新完 poolFactors（本方法只读当前因子重算 effectiveRPM）。
+func (h *Hub) ReloadPacer(a *config.Account, poolClass string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	s := h.Settings()
+	k := key(a.ID, poolClass)
+	rpm := h.effectiveRPMLocked(a, poolClass, s)
+	if p, ok := h.pacers[k]; ok {
+		p.Reconfigure(rpm, s.PacingWindowSec)
+	} else {
+		h.pacers[k] = pacer.New(rpm, s.PacingWindowSec)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 候选筛选
 // ---------------------------------------------------------------------------
@@ -447,6 +512,14 @@ func (h *Hub) tryRevive(id string) {
 // StartMaintenance 启动后台维护：熔断复活 + 到期绑定清理 + 因子落盘。
 func (h *Hub) StartMaintenance(ctx context.Context) {
 	go func() {
+		// P0-2：维护循环是「挂机无人值守」的关键后台任务，任何一次 panic 都不得让
+		// 它退出（否则 30s 的熔断复活 / 因子落盘全停）。每轮单独 recover。
+		defer func() {
+			if e := recover(); e != nil {
+				h.Metrics.PanicsTotal.Add(1)
+				log.Printf("[panic-recovered] maintenance loop: %v\n%s", e, debug.Stack())
+			}
+		}()
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -455,7 +528,15 @@ func (h *Hub) StartMaintenance(ctx context.Context) {
 				h.flushFactors()
 				return
 			case <-ticker.C:
-				h.flushFactors()
+				func() {
+					defer func() {
+						if e := recover(); e != nil {
+							h.Metrics.PanicsTotal.Add(1)
+							log.Printf("[panic-recovered] maintenance tick: %v\n%s", e, debug.Stack())
+						}
+					}()
+					h.flushFactors()
+				}()
 			}
 		}
 	}()
@@ -735,6 +816,65 @@ func (h *Hub) TrackInflight(accountID string, delta int) {
 	h.inflight[accountID] = maxInt(0, h.inflight[accountID]+delta)
 }
 
+// InflightTotal 全部账号当前在途请求总数（优雅停机据此判断「等待在途完成」）。
+func (h *Hub) InflightTotal() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	total := 0
+	for _, n := range h.inflight {
+		total += n
+	}
+	return total
+}
+
+// ---------------------------------------------------------------------------
+// 富健康度观测（P1-4：/healthz 不仅报 ok，还报「网关到底能不能干活」）
+// ---------------------------------------------------------------------------
+
+// QueueDepth 当前排队的请求总数（所有池的 pacer.Waiting() 之和）。
+func (h *Hub) QueueDepth() int {
+	h.mu.Lock()
+	total := 0
+	for _, p := range h.pacers {
+		total += p.Waiting()
+	}
+	h.mu.Unlock()
+	return total
+}
+
+// BreakerOpenCount 当前处于熔断（已禁用、等待复活）中的账号数。
+func (h *Hub) BreakerOpenCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	now := time.Now()
+	n := 0
+	for _, at := range h.reviveAt {
+		if now.Before(at) {
+			n++
+		}
+	}
+	return n
+}
+
+// LastSuccessAgeMS 距全局最近一次上游成功的毫秒数；从未成功则 -1。
+func (h *Hub) LastSuccessAgeMS() int64 {
+	ns := h.Metrics.LastSuccessNS.Load()
+	if ns == 0 {
+		return -1
+	}
+	return time.Since(time.Unix(0, ns)).Milliseconds()
+}
+
+// Upstream429RatePerMin 最近 60s 真实命中上游 429 的次数（富健康度信号）。
+func (h *Hub) Upstream429RatePerMin() int {
+	return h.Recent429.PerMinute()
+}
+
+// PanicsTotal 已被 recover 兜住的 panic 次数。
+func (h *Hub) PanicsTotal() int64 {
+	return h.Metrics.PanicsTotal.Load()
+}
+
 // ---------------------------------------------------------------------------
 // 领槽位
 // ---------------------------------------------------------------------------
@@ -792,6 +932,7 @@ func (h *Hub) Acquire(ctx context.Context, a *config.Account, poolClass string) 
 func (h *Hub) OnRateLimited(a *config.Account, poolClass string) {
 	s := h.Settings()
 	h.Metrics.Upstream429.Add(1)
+	h.Recent429.record() // P1-4：富健康度——最近 60s 429 速率
 
 	floor := s.MinLearnedFactor
 	if floor <= 0 {
@@ -833,7 +974,10 @@ func (h *Hub) OnRateLimited(a *config.Account, poolClass string) {
 		}
 		return true
 	})
-	h.Reload()
+	// P1-3/P2-4：429 高频路径只收紧受影响的「单个账号 × 单个池」节拍器，
+	// 不再做全量快照 Reload()（O(账号×池) 重新初始化，429 风暴时拖慢换号循环）。
+	// 账号集 / 设置在此路径不会变，仅这一个池因子变了，单 pacer reload 即可覆盖。
+	h.ReloadPacer(a, poolClass)
 }
 
 // OnSuccess 按「成功次数」回升校准因子（而非按墙钟 —— 墙钟回升在低流量账号上
@@ -920,6 +1064,8 @@ func (h *Hub) NoteSuccess(a *config.Account) {
 		return true
 	})
 	h.Metrics.RequestsOK.Add(1)
+	// P1-4：全局最近成功时间戳（/healthz last_success_age_ms）。
+	h.Metrics.LastSuccessNS.Store(time.Now().UnixNano())
 }
 
 // ---------------------------------------------------------------------------

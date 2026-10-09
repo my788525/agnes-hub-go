@@ -29,7 +29,7 @@ import (
 	"agneshub/internal/web"
 )
 
-var version = "1.0.13"
+var version = "1.0.14"
 
 func env(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -79,7 +79,7 @@ func main() {
 	defer cancel()
 	h.StartMaintenance(ctx)
 
-	srv := web.New(store, h, relay.BuildClient())
+	srv := web.New(store, h, relay.BuildClientForAccounts(len(store.AccountsSnapshot())))
 	srv.Version = version
 
 	// 初始化自更新器
@@ -99,6 +99,13 @@ func main() {
 	// 应用完更新后要真的退出：光置一个标志位没人看，
 	// 必须有人把它翻译成取消信号，进程才会走到优雅关闭。
 	go func() {
+		// P0-2：自更新轮询 goroutine 若 panic 会丢失「自动重启」能力（挂机下影响升级），
+		// 加 recover 保护，单轮 panic 不退出循环。
+		defer func() {
+			if e := recover(); e != nil {
+				log.Printf("[panic-recovered] update-watch goroutine: %v", e)
+			}
+		}()
 		t := time.NewTicker(500 * time.Millisecond)
 		defer t.Stop()
 		for {
@@ -106,9 +113,18 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-t.C:
+				func() {
+					defer func() {
+						if e := recover(); e != nil {
+							log.Printf("[panic-recovered] update-watch tick: %v", e)
+						}
+					}()
+					if upd.NeedRestart() {
+						fmt.Println("自更新已就位，正在退出以便替换二进制…")
+						cancel()
+					}
+				}()
 				if upd.NeedRestart() {
-					fmt.Println("自更新已就位，正在退出以便替换二进制…")
-					cancel()
 					return
 				}
 			}
@@ -158,7 +174,18 @@ func main() {
 
 	go func() {
 		<-ctx.Done()
-		shutdownCtx, c := context.WithTimeout(context.Background(), 8*time.Second)
+		// P1-2 优雅停机：先等在途（relay 层）请求排空再关 server，避免长视频任务 /
+		// 流式长回答被硬切。InflightTotal()==0 即排空；30s 宽限兜底（挂机的任务
+		// 不会因一次正常停机而白干，但也不会让进程永远退不出）。
+		deadline := time.Now().Add(30 * time.Second)
+		for h.InflightTotal() > 0 && time.Now().Before(deadline) {
+			log.Printf("优雅停机：等待 %d 个在途请求完成…", h.InflightTotal())
+			time.Sleep(500 * time.Millisecond)
+		}
+		if h.InflightTotal() > 0 {
+			log.Printf("优雅停机：30s 宽限到达仍有 %d 个在途请求，将随进程关闭（视频任务可通过 job_id 跨重启续查）", h.InflightTotal())
+		}
+		shutdownCtx, c := context.WithTimeout(context.Background(), 30*time.Second)
 		defer c()
 		_ = httpSrv.Shutdown(shutdownCtx)
 	}()

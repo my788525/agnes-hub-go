@@ -14,7 +14,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -60,7 +62,45 @@ func (s *Server) SetUpdater(u *updater.Updater) { s.Updater = u }
 func (s *Server) UpdaterInstance() *updater.Updater { return s.Updater }
 
 // ServeHTTP 实现 http.Handler。
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
+//
+// P0-2：最外层套 recover 兜底。任何 handler 内 panic（如某条解析/编码路径遇到畸形数据）
+// 都会被接住并回 500，而不是让标准库 net/http 关闭连接——关键是若该请求在独立 goroutine
+// 里 panic（见下方流式路径的 recoverGoroutine），没有兜底会直接终止整个进程、带走所有
+// 在途任务。这里是「挂机无人值守」的地基。
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	defer recoverHandler(s, w, r)
+	s.mux.ServeHTTP(w, r)
+}
+
+// recoverHandler 是 ServeHTTP 的 panic 兜底：记录堆栈、计数、回 500。
+func recoverHandler(s *Server, w http.ResponseWriter, r *http.Request) {
+	if e := recover(); e != nil {
+		if s.Hub != nil {
+			s.Hub.Metrics.PanicsTotal.Add(1)
+		}
+		log.Printf("[panic-recovered] handler %s %s: %v\n%s", r.Method, r.URL.Path, e, debug.Stack())
+		// 若响应头尚未写出则回 500；已写出（中途 panic）则只能断开，连接由 http 处理。
+		if w.Header().Get("Content-Type") == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		_, _ = w.Write([]byte(`{"error":{"message":"网关内部错误（已降级，不影响其他请求）","type":"internal_error"}}`))
+	}
+}
+
+// recoverGoroutine 在独立的 helper goroutine 里 recover，避免该 goroutine panic 终止整个进程。
+func recoverGoroutine(hub *hub.Hub, what string) (e any) {
+	defer func() {
+		e = recover()
+		if e != nil {
+			if hub != nil {
+				hub.Metrics.PanicsTotal.Add(1)
+			}
+			log.Printf("[panic-recovered] goroutine %s: %v\n%s", what, e, debug.Stack())
+		}
+	}()
+	return e
+}
 
 func (s *Server) routes() {
 	m := s.mux
@@ -309,10 +349,22 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if ver == "" {
 		ver = "dev"
 	}
+	// P1-4 富健康度：不仅报「进程活着」，还报「网关到底还能不能干活」——
+	// 队列深度、熔断中账号数、最近 60s 429 速率、距最近一次成功的时长、panic 数。
+	// 外部探活脚本可据此做比 200 更有语义的判定（例如 breaker_open_count>0 且
+	// last_success_age_ms 很大 → 虽然进程活着，但所有账号都在熔断，实际不可用）。
+	lastSuccessAgeMS := s.Hub.LastSuccessAgeMS()
 	writeJSON(w, 200, map[string]any{
-		"ok": true, "accounts": enabled,
-		"uptime_sec": int(time.Since(s.Hub.Metrics.StartedAt).Seconds()),
-		"version":    ver,
+		"ok":                 true,
+		"accounts":           enabled,
+		"uptime_sec":         int(time.Since(s.Hub.Metrics.StartedAt).Seconds()),
+		"version":            ver,
+		"available_accounts": enabled,
+		"queue_depth":        s.Hub.QueueDepth(),
+		"breaker_open":       s.Hub.BreakerOpenCount(),
+		"last_success_age_ms": lastSuccessAgeMS,
+		"upstream_429_rate_per_min": s.Hub.Upstream429RatePerMin(),
+		"panics_total":       s.Hub.PanicsTotal(),
 	}, nil)
 }
 
@@ -371,7 +423,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 //   - 不使用 prometheus.Client 依赖（保持零外部依赖），自己拼行。
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	h := s.Hub
-	m := h.Metrics
+	m := &h.Metrics // 取指针，避免拷贝含 sync/atomic 的 Metrics（vet 提示）
 	startedAt := h.Metrics.StartedAt.Unix()
 	settings := h.Settings()
 
@@ -444,6 +496,23 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	sb.WriteString("# HELP baiPiao_hub_breaker_revived Breakers revived after cooldown\n")
 	sb.WriteString("# TYPE baiPiao_hub_breaker_revived counter\n")
 	sb.WriteString(fmt.Sprintf("baiPiao_hub_breaker_revived %d\n", m.BreakerRevived.Load()))
+
+	// P1-4 富健康度：panic 总数 / 最近 60s 429 速率 / 排队深度 / 熔断中账号数。
+	sb.WriteString("# HELP baiPiao_hub_panics_total Recovered panics (degraded, not crashed)\n")
+	sb.WriteString("# TYPE baiPiao_hub_panics_total counter\n")
+	sb.WriteString(fmt.Sprintf("baiPiao_hub_panics_total %d\n", m.PanicsTotal.Load()))
+
+	sb.WriteString("# HELP baiPiao_hub_upstream_429_rate_per_min Upstream 429s in the last 60s\n")
+	sb.WriteString("# TYPE baiPiao_hub_upstream_429_rate_per_min gauge\n")
+	sb.WriteString(fmt.Sprintf("baiPiao_hub_upstream_429_rate_per_min %d\n", h.Upstream429RatePerMin()))
+
+	sb.WriteString("# HELP baiPiao_hub_queue_depth Requests currently queued across all pacers\n")
+	sb.WriteString("# TYPE baiPiao_hub_queue_depth gauge\n")
+	sb.WriteString(fmt.Sprintf("baiPiao_hub_queue_depth %d\n", h.QueueDepth()))
+
+	sb.WriteString("# HELP baiPiao_hub_breaker_open_count Accounts currently circuit-opened\n")
+	sb.WriteString("# TYPE baiPiao_hub_breaker_open_count gauge\n")
+	sb.WriteString(fmt.Sprintf("baiPiao_hub_breaker_open_count %d\n", h.BreakerOpenCount()))
 
 	sb.WriteString("# HELP baiPiao_hub_wait_ms_total Total wait time in milliseconds\n")
 	sb.WriteString("# TYPE baiPiao_hub_wait_ms_total counter\n")
@@ -585,12 +654,20 @@ func (s *Server) handleTextish(w http.ResponseWriter, r *http.Request, path stri
 		bodyFor = s.bodyForAccount(body, poolClass, intent.Text, settings)
 	} else {
 		resolved := pool.ResolveModel(requested, settings.ModelAliases)
-		clone := cloneBody(body)
-		clone["model"] = resolved
-		buf, _ := json.Marshal(clone)
 		requiredModel = resolved
 		decision.ModelUsed = resolved
-		bodyFor = func(*config.Account) ([]byte, string) { return buf, resolved }
+		if resolved == requested {
+			// P2-2：客户端已显式给对模型名（别名解析原样返回），body 的 model 字段
+			// 已是 resolved，无需改写 —— 直接复用原始请求体，省一次 clone + Marshal
+			// 的热路径开销（高频对话路径，且 rawBody 里 model==resolved 语义等价）。
+			bodyFor = func(*config.Account) ([]byte, string) { return rawBody, resolved }
+		} else {
+			// 命中别名：body 里的 model 仍是旧名，必须改写后才转发。
+			clone := cloneBody(body)
+			clone["model"] = resolved
+			buf, _ := json.Marshal(clone)
+			bodyFor = func(*config.Account) ([]byte, string) { return buf, resolved }
+		}
 	}
 
 	sessionKey := s.Hub.SessionKey(headerMap(r), item.Key)
@@ -602,6 +679,8 @@ func (s *Server) handleTextish(w http.ResponseWriter, r *http.Request, path stri
 		// Body 仅用于日志「用户提出的完整请求」展示；实际转发由 BodyFor 生成
 		// （relay.Do 中 BodyFor 非 nil 时优先），故此处填原始请求体不影响请求本身。
 		Body: rawBody,
+		// Stream：客户端要流式时用「空闲看门狗」替代固定墙钟超时，长回答不断流。
+		Stream: wantsStream,
 	}
 	s.logUsage(item, decision, poolClass, r, path, wantsStream)
 	s.proxy(w, r, item, opts, decision, wantsStream)
@@ -916,6 +995,10 @@ func (s *Server) serveAutoVideo(w http.ResponseWriter, r *http.Request, item *co
 }
 
 // waitForVideo 轮询等待视频完成，返回 video_url 或空串。
+//
+// P2-1：轮询间隔用指数退避（base → 2×base → … 封顶 30s）。视频生成通常需数分钟，
+// 早期密集轮询对「拿到结果」几乎没有额外收益，反而持续打上游；退避后上游压力显著下降，
+// 同时仍能在任务完成时以 ≤30s 粒度感知到（挂机场景友好，不长时间漏掉结果）。
 func (s *Server) waitForVideo(ctx context.Context, account *config.Account, job *config.VideoJob, maxSec int) string {
 	settings := s.Store.SettingsSnapshot()
 	deadline := time.Now().Add(time.Duration(maxSec) * time.Second)
@@ -923,6 +1006,7 @@ func (s *Server) waitForVideo(ctx context.Context, account *config.Account, job 
 	if interval < time.Second {
 		interval = 5 * time.Second
 	}
+	const capInterval = 30 * time.Second
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
@@ -930,11 +1014,15 @@ func (s *Server) waitForVideo(ctx context.Context, account *config.Account, job 
 		case <-time.After(interval):
 		}
 		body := s.pollUpstream(ctx, account, job)
-		if body == nil {
-			continue
+		if body != nil {
+			if url := extractVideoURL(body); url != "" {
+				return url
+			}
 		}
-		if url := extractVideoURL(body); url != "" {
-			return url
+		// 指数退避：每轮成功尝试后把下一轮间隔翻倍，封顶 capInterval。
+		interval *= 2
+		if interval > capInterval {
+			interval = capInterval
 		}
 	}
 	return ""
@@ -1148,6 +1236,18 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 	ctx2, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go func() {
+		defer func() {
+			// P0-2：relay.Do 内部任何 panic（罕见畸形数据/空指针）都不得终止整个进程。
+			// 正常路径下 body 已发送 outcome、defer 什么都不做；仅 panic 时在此补发一个
+			// 带错误的 outcome，保证主 select 一定能收到、不会永久阻塞。
+			if e := recover(); e != nil {
+				if s.Hub != nil {
+					s.Hub.Metrics.PanicsTotal.Add(1)
+				}
+				log.Printf("[panic-recovered] stream relay: %v\n%s", e, debug.Stack())
+				ch <- outcome{err: fmt.Errorf("网关内部错误：请求处理 panic（已降级）")}
+			}
+		}()
 		result, err := relay.Do(ctx2, s.Hub, s.Client, opts)
 		ch <- outcome{result: result, err: err}
 	}()
