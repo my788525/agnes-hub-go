@@ -21,6 +21,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -238,14 +239,27 @@ func Do(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) (*Re
 	if retryMax < 0 {
 		retryMax = 0
 	}
+	// #25：429（限流/达到最大额度）走一条独立的「网关内长预算」重试路径。
+	// 它是「受理前拒绝、重试安全」，网关会换账号 + 重新排队 + 感知 Retry-After 退避地
+	// 自动重试，直到成功或耗尽预算，期间不透传 429 给客户端，从而不中断在途任务。
+	// RateLimitRetryMax=0 沿用 RetryMax；RateLimitWaitBudgetMS=0 表示不限等待预算。
+	rateLimitRetries := s.RateLimitRetryMax
+	if rateLimitRetries == 0 {
+		rateLimitRetries = retryMax
+	}
+	rateLimitBudgetMS := int64(s.RateLimitWaitBudgetMS)
 
 	exclude := map[string]bool{}
 	var totalWait int64
 	var last *Result
+	var rl429Used int    // 已用 429 内部重试次数
+	var rl429WaitMS int64 // 429 内部重试累计退避等待（ms），受预算约束
 	// 记录一次到达，供控制台「到达密度 vs 节拍」观测。
 	h.Arrivals.Add()
+	// #24：记录一次负载画像（模态 + 是否流式），供接入方自动检测匹配情景。
+	h.NoteRequest(opts.PoolClass, opts.Stream)
 
-	for attempt := 0; attempt <= retryMax; attempt++ {
+	for attempt := 0; ; attempt++ {
 		picked, err := h.Pick(opts.SessionKey, opts.PoolClass, opts.Pinned, opts.RequiredModel, exclude)
 		if err != nil {
 			return nil, err
@@ -294,6 +308,24 @@ func Do(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) (*Re
 		}
 
 		exclude[account.ID] = true
+
+		// #25：429（限流/达到最大额度）走「网关内长预算自动重试」——换账号 + 重新排队 +
+		// 感知 Retry-After 退避，直到成功或预算耗尽，期间不透传 429 给客户端，
+		// 从而不中断客户端在途任务。预算耗尽才把最后一次 429 透传（由 server 补 Retry-After）。
+		if result.Status == http.StatusTooManyRequests {
+			budgetGone := rateLimitBudgetMS > 0 && rl429WaitMS >= rateLimitBudgetMS
+			if rl429Used >= rateLimitRetries || budgetGone {
+				h.Metrics.RequestsError.Add(1)
+				h.Metrics.WaitMS.Add(result.WaitMS)
+				return result, nil
+			}
+			w := sleep429(ctx, h, s, opts.PoolClass, result.Header, rl429Used)
+			rl429WaitMS += w.Milliseconds()
+			rl429Used++
+			continue
+		}
+
+		// 非 429 的可重试失败（408/5xx/401/403）：走普通 retryMax 预算。
 		if attempt < retryMax {
 			sleepBackoff(ctx, s, attempt)
 			continue
@@ -566,6 +598,65 @@ func sleepBackoff(ctx context.Context, s config.Settings, attempt int) {
 	case <-time.After(time.Duration(float64(delay) * jitter)):
 	case <-ctx.Done():
 	}
+}
+
+// parseRetryAfter 解析上游 429 的 Retry-After 头（秒数或 HTTP 日期），返回建议等待秒数；
+// 未带该头（免费号 agnes 常不带）时返回 0，由调用方用池投影等待兜底。
+func parseRetryAfter(header http.Header) float64 {
+	raw := strings.TrimSpace(header.Get("Retry-After"))
+	if raw == "" {
+		return 0
+	}
+	if sec, err := strconv.ParseFloat(raw, 64); err == nil {
+		if sec < 0 {
+			return 0
+		}
+		return sec
+	}
+	if t, err := http.ParseTime(raw); err == nil {
+		sec := t.Sub(time.Now()).Seconds()
+		if sec < 0 {
+			sec = 0
+		}
+		return sec
+	}
+	return 0
+}
+
+// sleep429 是一次 429 内部重试前的等待：优先用上游 Retry-After（钳到 [0,120]s），
+// 否则用该池当前投影等待（下一空闲槽）+ 一轮指数退避兜底；全程可被 ctx 取消。
+// 返回实际等待的时长（用于累计 429 等待预算）。
+func sleep429(ctx context.Context, h *hub.Hub, s config.Settings, poolClass string, header http.Header, attempt int) time.Duration {
+	waitSec := parseRetryAfter(header)
+	if waitSec <= 0 {
+		// 免费号常不带 Retry-After：用池投影等待（下一空闲槽）作为下限，避免拍满节拍。
+		projMS := h.PoolMaxProjectedWaitMS(poolClass)
+		if float64(projMS)/1000.0 > waitSec {
+			waitSec = float64(projMS) / 1000.0
+		}
+		// 再叠一轮温和指数退避（base * 2^attempt，钳到 cap），避免全员同节拍重试。
+		exp := int(attempt)
+		mult := 1 << uint(exp)
+		backoffMS := float64(s.RetryBaseBackoffMS) * float64(mult)
+		if capMS := float64(s.RetryMaxBackoffMS); backoffMS > capMS {
+			backoffMS = capMS
+		}
+		waitSec += backoffMS / 1000.0
+	}
+	if waitSec > 120 {
+		waitSec = 120 // 单次等待上限，防止 Retry-After 异常大值挂死
+	}
+	jitter := 0.85 + rand.Float64()*0.3
+	d := time.Duration(float64(waitSec) * jitter * 1000) * time.Millisecond
+	if d <= 0 {
+		return 0
+	}
+	start := time.Now()
+	select {
+	case <-time.After(d):
+	case <-ctx.Done():
+	}
+	return time.Since(start)
 }
 
 func errorBody(message, etype string) []byte {

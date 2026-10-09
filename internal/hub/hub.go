@@ -91,6 +91,15 @@ type Hub struct {
 	// 只用 h.mu 保护（短临界区，不嵌套），与 Pacer() 共享同一把锁互斥安全。
 	highWaiting map[string]int
 
+	// #24 负载画像遥测：近 120s 模态分布 + 流式比，供接入方自动检测匹配情景。
+	load loadWindow
+
+	// #24 AutoScenario 冷却防抖：最近一次自动切换情景的时间 + 当时的目标情景。
+	// 同一情景 60s 内不重复切（避免在两个情景边界来回抖动）。
+	autoMu          sync.Mutex
+	lastAutoSwitch  time.Time
+	lastAutoScenario string
+
 	// Metrics 是运行指标（/healthz 与控制台观测）。
 	Metrics Metrics
 }
@@ -200,6 +209,101 @@ func (r *arrivalRing) TotalCount() int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.total
+}
+
+// ---------------------------------------------------------------------------
+// 负载画像遥测（#24：接入方自动检测匹配情景的数据来源）
+// ---------------------------------------------------------------------------
+
+// loadWindow 用两个 60s 桶累计近 120s 的请求模态分布（text/image/video）与流式占比。
+// 只按「当前桶起点」整体 60s 滚动（桶0 满 60s 整体挪到桶1、桶0 清零），单 goroutine
+// 写入（NoteRequest）+ 控制台/维护循环读取时加锁，避免按秒细桶的精度开销。
+type loadWindow struct {
+	mu     sync.Mutex
+	modal  [2][3]int64 // [text, image, video]
+	stream [2]int64
+	total  [2]int64
+	start  [2]time.Time
+}
+
+const (
+	modalText, modalImage, modalVideo = 0, 1, 2
+)
+
+// record 记一次请求（modality 为 text/image/video 之一，其余按 text 计）。
+func (w *loadWindow) record(modality string, stream bool) {
+	idx := modalText
+	switch modality {
+	case "image":
+		idx = modalImage
+	case "video":
+		idx = modalVideo
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	now := time.Now()
+	// 桶0 满 60s → 整体滚动到桶1，桶0 清零重起
+	if !w.start[0].IsZero() && now.Sub(w.start[0]) >= 60*time.Second {
+		w.modal[1] = w.modal[0]
+		w.stream[1] = w.stream[0]
+		w.total[1] = w.total[0]
+		w.start[1] = w.start[0]
+		w.modal[0] = [3]int64{0, 0, 0}
+		w.stream[0] = 0
+		w.total[0] = 0
+		w.start[0] = now
+	}
+	if w.start[0].IsZero() {
+		w.start[0] = now
+	}
+	w.modal[0][idx]++
+	w.total[0]++
+	if stream {
+		w.stream[0]++
+	}
+}
+
+// profile 把两桶（近 120s）合并成模态占比 + 流式比。
+func (w *loadWindow) profile() (total int, text, image, video, stream int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	text = int(w.modal[0][modalText] + w.modal[1][modalText])
+	image = int(w.modal[0][modalImage] + w.modal[1][modalImage])
+	video = int(w.modal[0][modalVideo] + w.modal[1][modalVideo])
+	stream = int(w.stream[0] + w.stream[1])
+	total = int(w.total[0] + w.total[1])
+	return
+}
+
+// NoteRequest 记录一次请求的模态与是否流式（relay 入口埋点，轻量）。
+func (h *Hub) NoteRequest(modality string, stream bool) {
+	h.load.record(modality, stream)
+}
+
+// LoadProfile 采集接入方实时负载画像（近 120s 模态分布 + 流式比 + 当前并发 + 429 率），
+// 供 config.RecommendScenario 自动匹配情景。
+func (h *Hub) LoadProfile() config.LoadProfile {
+	total, text, image, video, stream := h.load.profile()
+	ratio := func(n int) float64 {
+		if total <= 0 {
+			return 0
+		}
+		return float64(n) / float64(total)
+	}
+	var streamRatio float64
+	// 流式占比只对文本请求有意义（流式只会出现在文本池）
+	if text > 0 {
+		streamRatio = float64(stream) / float64(text)
+	}
+	return config.LoadProfile{
+		TotalRecent:     total,
+		TextRatio:       ratio(text),
+		ImageRatio:      ratio(image),
+		VideoRatio:      ratio(video),
+		StreamRatio:     streamRatio,
+		ConcurrencyNow:  h.InflightTotal(),
+		Upstream429Rate: h.Upstream429RatePerMin(),
+	}
 }
 
 // New 构造调度器。
@@ -543,6 +647,7 @@ func (h *Hub) StartMaintenance(ctx context.Context) {
 						}
 					}()
 					h.flushFactors()
+					h.maybeAutoScenario()
 				}()
 			}
 		}
@@ -574,6 +679,53 @@ func (h *Hub) flushFactors() {
 	h.store.FlushKeys()
 	h.store.FlushUsage()
 	h.store.FlushBindings()
+}
+
+// maybeAutoScenario 维护循环调用（#24）：AutoScenario 开启时，按实时负载画像推荐
+// 最贴合的情景并自动切换，带 60s 冷却防抖（同一目标情景不重复切、避免边界抖动）。
+// 只改全局旋钮 + 热重载，账号级 RPMOverrides 仍优先；控制台可随时关闭 AutoScenario
+// 改回人工选定。
+func (h *Hub) maybeAutoScenario() {
+	s := h.Settings()
+	if !s.AutoScenario {
+		return
+	}
+	profile := h.LoadProfile()
+	if profile.TotalRecent == 0 {
+		return // 无负载数据不动
+	}
+	recommended, reason := config.RecommendScenario(profile)
+	// 已是目标情景：不重复切
+	if s.Scenario == recommended.Name {
+		return
+	}
+	// 冷却防抖：距上次自动切换（且目标不变）不足 60s 则不切
+	h.autoMu.Lock()
+	if !h.lastAutoSwitch.IsZero() && h.lastAutoScenario == recommended.Name &&
+		time.Since(h.lastAutoSwitch) < 60*time.Second {
+		h.autoMu.Unlock()
+		return
+	}
+	h.lastAutoSwitch = time.Now()
+	h.lastAutoScenario = recommended.Name
+	h.autoMu.Unlock()
+
+	// 落盘情景 + 热重载（ApplyScenario 改全局旋钮，Reload 重算 pacer/sem）
+	h.store.UpdateSettings(func(st *config.Settings) {
+		if config.ApplyScenario(st, recommended.Name) {
+			st.AutoScenario = true // 保持开关不被清空
+		}
+	})
+	h.Reload() // 让 cfg 缓存 + pacer/sem 拾取新情景旋钮
+	log.Printf("[auto-scenario] 负载画像(%s) → 自动切情景「%s」：%s",
+		describeProfile(profile), recommended.Name, reason)
+}
+
+// describeProfile 把负载画像渲染成一行摘要（日志/控制台用）。
+func describeProfile(p config.LoadProfile) string {
+	return fmt.Sprintf("近120s %d 请求, 文%.0f%%/图%.0f%%/视%.0f%%, 流式%.0f%%, 并发%d, 429/min %d",
+		p.TotalRecent, p.TextRatio*100, p.ImageRatio*100, p.VideoRatio*100,
+		p.StreamRatio*100, p.ConcurrencyNow, p.Upstream429Rate)
 }
 
 // BindFactor 立即把某个 (账号 × 池) 因子落盘（控制台重置时用）。

@@ -1079,10 +1079,33 @@ func (s *Server) apiListScenarios(w http.ResponseWriter, r *http.Request) {
 		s.deny(w)
 		return
 	}
+	current := s.Store.SettingsSnapshot()
+	var recommend map[string]any
+	if s.Hub != nil {
+		profile := s.Hub.LoadProfile()
+		recommended, reason := config.RecommendScenario(profile)
+		recommend = map[string]any{
+			"name":   recommended.Name,
+			"reason": reason,
+			"profile": profile,
+			"describe": describeLoadProfile(profile),
+		}
+	}
 	writeJSON(w, 200, map[string]any{
-		"current": s.Store.SettingsSnapshot().Scenario,
+		"current": current.Scenario,
+		"auto_scenario": current.AutoScenario,
+		"rate_limit_retry_max": current.RateLimitRetryMax,
+		"rate_limit_wait_budget_ms": current.RateLimitWaitBudgetMS,
 		"scenarios": config.ScenarioPresets(),
+		"recommend": recommend,
 	}, nil)
+}
+
+// describeLoadProfile 把负载画像渲染成一行中文摘要（控制台「自动检测」区块用）。
+func describeLoadProfile(p config.LoadProfile) string {
+	return fmt.Sprintf("近120s %d 请求，文 %.0f%% / 图 %.0f%% / 视 %.0f%%，流式 %.0f%%，并发 %d，429/min %d",
+		p.TotalRecent, p.TextRatio*100, p.ImageRatio*100, p.VideoRatio*100,
+		p.StreamRatio*100, p.ConcurrencyNow, p.Upstream429Rate)
 }
 
 func (s *Server) apiGetSettings(w http.ResponseWriter, r *http.Request) {
@@ -1201,6 +1224,12 @@ func applySettings(st *config.Settings, p map[string]any) {
 	if v, ok := p["text_two_level_queue"]; ok {
 		st.TextTwoLevelQueue = truthy(v)
 	}
+	// 自动情景开关 + 429 网关内自动重试预算（与情景解耦，任何情景下都生效）
+	if v, ok := p["auto_scenario"]; ok {
+		st.AutoScenario = truthy(v)
+	}
+	i("rate_limit_retry_max", &st.RateLimitRetryMax)
+	i("rate_limit_wait_budget_ms", &st.RateLimitWaitBudgetMS)
 
 	if v, ok := p["model_aliases"].(map[string]any); ok {
 		next := map[string]string{}

@@ -320,6 +320,20 @@ type Settings struct {
 	// 优先于流式（长生成）出队，只改出队顺序、不破坏该池 RPM 安全节拍。
 	// 多任务并行情景默认开启。
 	TextTwoLevelQueue bool `json:"text_two_level_queue"`
+	// RateLimitRetryMax 是上游 429（限流/达到最大额度）时【网关内部】的自动重试
+	// 次数上限。区别于 RetryMax（普通 5xx/408 退避）：429 是「受理前拒绝、重试安全」，
+	// 网关会在内部换账号 + 重新排队 + 感知 Retry-After 退避地自动重试，直到成功或
+	// 耗尽该预算，期间不透传 429 给客户端，从而不中断客户端的在途任务。
+	// 默认 6；填 0 表示沿用 RetryMax。
+	RateLimitRetryMax int `json:"rate_limit_retry_max"`
+	// RateLimitWaitBudgetMS 是 429 内部重试的「总等待预算」（ms）：所有 429 退避 +
+	// 排队等待累计超过它即停止重试并透传最后一次 429。默认 180000（3 分钟）；
+	// 填 0 表示不限（仅在 RateLimitRetryMax 耗尽时停）。防止限流持续时网关挂死。
+	RateLimitWaitBudgetMS int `json:"rate_limit_wait_budget_ms"`
+	// AutoScenario 开启后，维护循环会按实时负载画像（模态占比/流式比/并发/429）
+	// 周期性推荐并自动切换最贴合的情景（带冷却防抖，同一情景 60s 内不重复切）。
+	// 关闭时情景完全由人手在控制台选定/一键应用，不会静默翻转。默认 false。
+	AutoScenario bool `json:"auto_scenario"`
 	ChatPasswordHash     string `json:"chat_password_hash,omitempty"`
 	ChatPasswordSalt     string `json:"chat_password_salt,omitempty"`
 }
@@ -383,6 +397,9 @@ func DefaultSettings() Settings {
 		StreamIdleTimeoutMS: 60000, // 流式空闲看门狗：连续 60s 无新字节才断开
 		UsageLogMaxLines:    20000,  // usage.jsonl 滚动保留最大行数
 		UsageRequestLogBytes: 512,   // 日志「用户完整请求」保留字节上限
+		RateLimitRetryMax:     6,      // 429 网关内部自动重试次数上限（换账号+重新排队）
+		RateLimitWaitBudgetMS: 180000, // 429 内部重试总等待预算 3 分钟，超时才透传
+
 	}
 }
 
@@ -415,6 +432,11 @@ type ScenarioPreset struct {
 	StreamIdle  int      `json:"stream_idle_timeout_ms"`
 	TwoLevel    bool     `json:"text_two_level_queue"`
 	Region      string   `json:"region_priority"`
+	// 429 网关内自动重试预算（随情景走）：挂机批量/写代码更高更久（多等少错、不中断任务），
+	// 交互场景更短（快失败快切号），生图保守（非幂等、防重复扣费）。
+	// RateLimitRetryMax=0 表示沿用该情景 RetryMax；RateLimitWaitBudget=0 表示不限等待预算。
+	RateLimitRetryMax   int `json:"rate_limit_retry_max"`
+	RateLimitWaitBudget int `json:"rate_limit_wait_budget_ms"`
 }
 
 // ScenarioPresets 返回全部情景参数包（顺序即控制台展示顺序）。
@@ -426,36 +448,52 @@ func ScenarioPresets() []ScenarioPreset {
 			Safety: 0.9, FreeTextRPM: 10, RetryMax: 3, RetryBaseMS: 500, RetryCapMS: 8000,
 			QueueSize: 200, QueueWaitMS: 120000, ImageConc: 4, VideoInFlt: 2,
 			StreamIdle: 60000, TwoLevel: false, Region: "cn_first",
+			RateLimitRetryMax: 4, RateLimitWaitBudget: 90000, // 90s：均衡场景，429 适度自动重试
 		},
 		{
 			Name: "code", Desc: "代码编写：文本高优、首字节延迟优先；重试更快、生图/视频让路",
 			Safety: 0.95, FreeTextRPM: 10, RetryMax: 3, RetryBaseMS: 400, RetryCapMS: 4000,
 			QueueSize: 200, QueueWaitMS: 60000, ImageConc: 2, VideoInFlt: 1,
 			StreamIdle: 60000, TwoLevel: false, Region: "cn_first",
+			RateLimitRetryMax: 5, RateLimitWaitBudget: 60000, // 60s：交互写代码偏短快，适度自动重试
 		},
 		{
 			Name: "image", Desc: "图片生成：拉满 8 号并发生图，文本降档给生图让路",
 			Safety: 0.9, FreeTextRPM: 6, RetryMax: 3, RetryBaseMS: 500, RetryCapMS: 8000,
 			QueueSize: 200, QueueWaitMS: 120000, ImageConc: 8, VideoInFlt: 1,
 			StreamIdle: 60000, TwoLevel: false, Region: "cn_first",
+			RateLimitRetryMax: 3, RateLimitWaitBudget: 60000, // 生图非幂等，保守自动重试防重复扣费
 		},
 		{
 			Name: "auto", Desc: "自动判断：文本/生图/生视频均衡，交给意图判定路由",
 			Safety: 0.9, FreeTextRPM: 10, RetryMax: 3, RetryBaseMS: 500, RetryCapMS: 8000,
 			QueueSize: 200, QueueWaitMS: 120000, ImageConc: 4, VideoInFlt: 2,
 			StreamIdle: 60000, TwoLevel: false, Region: "cn_first",
+			RateLimitRetryMax: 4, RateLimitWaitBudget: 90000,
 		},
 		{
 			Name: "multi", Desc: "多任务并行：多任务横向吃满 8 号，队列更深、429 退避保守、开两级队列（短调用优先）",
 			Safety: 0.85, FreeTextRPM: 10, RetryMax: 3, RetryBaseMS: 800, RetryCapMS: 12000,
 			QueueSize: 500, QueueWaitMS: 180000, ImageConc: 4, VideoInFlt: 2,
 			StreamIdle: 60000, TwoLevel: true, Region: "cn_first",
+			RateLimitRetryMax: 6, RateLimitWaitBudget: 180000, // 多任务深队列，429 自动重试更足
 		},
 		{
 			Name: "batch", Desc: "挂机批量：无人值守长跑，多等少错、最长空闲容忍，吞吐拉满",
 			Safety: 0.85, FreeTextRPM: 10, RetryMax: 3, RetryBaseMS: 1000, RetryCapMS: 15000,
 			QueueSize: 500, QueueWaitMS: 300000, ImageConc: 4, VideoInFlt: 2,
 			StreamIdle: 120000, TwoLevel: false, Region: "cn_first",
+			RateLimitRetryMax: 10, RateLimitWaitBudget: 300000, // 挂机批量最高预算：多等少错，5 分钟自动顶满
+		},
+		{
+			// #23：专为「接入 WorkBuddy 写代码 / 自动工具调用 / 方案生成，偶尔多任务并发」
+			// 定制的推荐一键预设。相比 multi 更贴文本负载：文本满血、工具短调用（非流式）
+			// 走两级队列优先出队、多任务深队列吃满 8 号、生图/视频让路、长方案流式更耐断流。
+			Name: "workbuddy", Desc: "WorkBuddy 写代码推荐：文本为主、工具短调用优先（两级队列）、多任务深队列吃满、生图/视频让路、长方案流式不断流",
+			Safety: 0.9, FreeTextRPM: 10, RetryMax: 3, RetryBaseMS: 500, RetryCapMS: 8000,
+			QueueSize: 400, QueueWaitMS: 180000, ImageConc: 2, VideoInFlt: 1,
+			StreamIdle: 90000, TwoLevel: true, Region: "cn_first",
+			RateLimitRetryMax: 8, RateLimitWaitBudget: 180000, // 写代码：429 高预算自动顶，不中断客户端在途任务
 		},
 	}
 }
@@ -499,8 +537,62 @@ func ApplyScenario(st *Settings, name string) bool {
 	st.StreamIdleTimeoutMS = p.StreamIdle
 	st.TextTwoLevelQueue = p.TwoLevel
 	st.RegionPriority = p.Region
+	// 429 网关内自动重试预算随情景走：挂机批量（batch）最多最久，写代码（workbuddy）高，
+	// 交互（code）适度，生图（image）保守。0 语义保留（RetryMax=0 沿用情景 RetryMax；
+	// WaitBudget=0 不限等待）。
+	st.RateLimitRetryMax = p.RateLimitRetryMax
+	st.RateLimitWaitBudgetMS = p.RateLimitWaitBudget
 	st.Scenario = p.Name
 	return true
+}
+
+// LoadProfile 是接入方的实时负载画像（近窗口统计，供自动检测匹配情景）。
+// 由 Hub.LoadProfile() 采集；比例字段用 0~1 浮点，0 表示该维度无数据。
+type LoadProfile struct {
+	TotalRecent     int     // 近窗口请求总数（0 = 无负载）
+	TextRatio       float64 // 文本占比
+	ImageRatio      float64 // 生图占比
+	VideoRatio      float64 // 生视频占比
+	StreamRatio     float64 // 流式请求占比（长生成特征）
+	ConcurrencyNow  int     // 当前在途并发数（多任务并行特征）
+	Upstream429Rate int     // 近 60s 真实命中 429 次数（限流压力）
+}
+
+// RecommendScenario 按负载画像推荐最贴合的情景 + 人类可读理由（纯函数，可单测）。
+// 与 7 个情景一一映射；数据不足时回落 default。
+func RecommendScenario(p LoadProfile) (ScenarioPreset, string) {
+	if p.TotalRecent == 0 {
+		preset, _ := FindScenario("default")
+		return preset, "暂无负载数据，用默认均衡"
+	}
+	// 1) 高 429 + 深队列诉求 → 挂机批量（多等少错、最长容忍）
+	if p.Upstream429Rate >= 3 {
+		preset, _ := FindScenario("batch")
+		return preset, "近期 429 压力大（近60s≥3次），切挂机批量：多等少错、最长空闲容忍、吞吐拉满"
+	}
+	// 2) 视频占比高 → 自动判断里的视频侧重（长任务、低并发）
+	if p.VideoRatio >= 0.4 {
+		preset, _ := FindScenario("auto")
+		return preset, "视频请求占比高（≥40%），切自动判断：均衡三模态、视频低并发"
+	}
+	// 3) 生图占比高 → 图片生成（拉满并发生图、文本让路）
+	if p.ImageRatio >= 0.4 {
+		preset, _ := FindScenario("image")
+		return preset, "生图请求占比高（≥40%），切图片生成：拉满 8 号并发生图、文本降档让路"
+	}
+	// 4) 多任务并发（在途高）+ 流式/短调用混合 → WorkBuddy 写代码推荐（文本为主 + 两级队列）
+	if p.ConcurrencyNow >= 3 || (p.TextRatio >= 0.7 && p.StreamRatio >= 0.5) {
+		preset, _ := FindScenario("workbuddy")
+		return preset, "文本为主且多任务并发（在途≥3 或 文本≥70%+流式≥50%），切 WorkBuddy 写代码推荐：工具短调用优先、多任务深队列、生图/视频让路"
+	}
+	// 5) 纯文本、低并发 → 代码编写（首字节延迟优先、快速重试）
+	if p.TextRatio >= 0.8 {
+		preset, _ := FindScenario("code")
+		return preset, "几乎全文本且低并发（文本≥80%），切代码编写：首字节延迟优先、生图/视频让路"
+	}
+	// 6) 其余 → 默认均衡
+	preset, _ := FindScenario("default")
+	return preset, "负载不偏向某一类，用默认均衡"
 }
 
 // ---------------------------------------------------------------------------
@@ -729,6 +821,14 @@ func normalizeSettings(v *Settings) {
 	// 情景模式：旧配置缺该字段时归到 default（不改任何旋钮，仅记录名）。
 	if v.Scenario == "" {
 		v.Scenario = "default"
+	}
+	// 429 网关内部重试预算：0 有语义（RetryMax=0 沿用 RetryMax；WaitBudget=0 不限时），
+	// 故不做 <=0 回落，只对负数兜底，防止填错负数导致行为怪异。
+	if v.RateLimitRetryMax < 0 {
+		v.RateLimitRetryMax = d.RateLimitRetryMax
+	}
+	if v.RateLimitWaitBudgetMS < 0 {
+		v.RateLimitWaitBudgetMS = d.RateLimitWaitBudgetMS
 	}
 }
 

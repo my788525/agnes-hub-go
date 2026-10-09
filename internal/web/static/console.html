@@ -207,11 +207,6 @@ function renderShell(){
   document.getElementById("btnRefresh").onclick = ()=>refresh();
   document.getElementById("btnLogout").onclick = async ()=>{ await api("/api/logout",{method:"POST"}); location.reload(); };
   document.getElementById("btnPw").onclick = changePassword;
-  if(state.session?.must_change_password){
-    const el = document.getElementById("mustChange");
-    el.className = "banner warn";
-    el.innerHTML = `为保障安全，请立即设置一个新管理员密码。<button class="sm primary" style="margin-left:8px" onclick="changePassword()">去修改</button>`;
-  }
 }
 async function changePassword(){
   const a = prompt("输入新密码（至少 6 位）"); if(!a) return;
@@ -763,6 +758,7 @@ function viewSettings(){
     ${hint?`<div class="hint">${hint}</div>`:""}</div>`;
   const scenarios = state.scenarios || [];
   const scOpts = scenarios.map(p=>`<option value="${esc(p.name)}" ${s.scenario===p.name?"selected":""}>${esc(p.name)} · ${esc(p.desc)}</option>`).join("");
+  const rec = (state.scenarioData && state.scenarioData.recommend) || null;
   return `
   <div class="card" style="border-color:var(--accent,#3b82f6)">
     <h2>运行情景（按网关执行方向一键侧重）</h2>
@@ -775,11 +771,39 @@ function viewSettings(){
       <button class="primary" id="btnApplyScenario">一键应用</button>
     </div>
     <div style="margin-top:10px">
-      <label style="display:flex;gap:6px;align-items:center">
-        <input type="checkbox" id="s_two_level" ${s.text_two_level_queue?"checked":""}>
-        文本两级队列：同池内非流式（工具/短调用）优先于流式（长生成）出队
+      <label for="s_two_level" style="display:flex;gap:8px;align-items:center;cursor:pointer">
+        <input type="checkbox" id="s_two_level" style="flex:0 0 16px;width:16px;height:16px;margin:0;padding:0" ${s.text_two_level_queue?"checked":""}>
+        <span>文本两级队列：同池内非流式（工具/短调用）优先于流式（长生成）出队</span>
       </label>
       <div class="hint">仅改出队顺序、不破坏该池 RPM 节拍；多任务并发卡顿明显时打开。</div>
+    </div>
+    <div style="margin-top:14px;padding-top:12px;border-top:1px dashed var(--border)">
+      <label for="s_auto_scenario" style="display:flex;gap:8px;align-items:center;cursor:pointer">
+        <input type="checkbox" id="s_auto_scenario" style="flex:0 0 16px;width:16px;height:16px;margin:0;padding:0" ${state.scenarioData&&state.scenarioData.auto_scenario?"checked":""}>
+        <span>自动检测接入方负载 → 一键匹配推荐情景</span>
+      </label>
+      <div class="hint">后台每 30s 采一次负载画像（文/图/视频占比、流式比、并发、429 压力），自动切到最贴合的情景；手动应用情景会同时保留此开关。</div>
+      ${rec?`
+      <div class="rec-card" style="margin-top:8px">
+        <div class="rec-row">
+          <span class="pill info">推荐情景：${esc(rec.name)}</span>
+          <button class="primary" id="btnApplyRec">按推荐一键应用</button>
+        </div>
+        <div class="hint">${esc(rec.reason||"")}</div>
+        <div class="muted" style="font-size:12px;margin-top:4px">当前画像：${esc(rec.describe||"暂无负载数据")}</div>
+      </div>`:`<div class="hint" style="margin-top:6px">暂无负载数据（还没请求过），画像积累后即可给出推荐。</div>`}
+    </div>
+    <div style="margin-top:14px;padding-top:12px;border-top:1px dashed var(--border)">
+      <h3 style="margin:0 0 6px">429 网关内自动重试（不中断客户端任务）</h3>
+      <div class="row" style="gap:10px;align-items:flex-end">
+        <div><label>429 自动重试次数上限</label>
+          <input id="s_rl_retry_max" type="number" value="${s.rate_limit_retry_max??6}">
+          <div class="hint">0=沿用普通 retry_max；限流时网关换号+重新排队自动重试到成功或到此为止</div></div>
+        <div><label>429 总等待预算（秒）</label>
+          <input id="s_rl_wait_budget_s" type="number" value="${Math.round((s.rate_limit_wait_budget_ms??180000)/1000)}">
+          <div class="hint">0=不限（仅按次数停）；累计退避等待超此即停并透传 429，防止持续限流时挂死</div></div>
+      </div>
+      <div class="hint">上游「达到最大限制/429」不再直接弹给客户端，而是网关内部排队+退避自动重试直到成功或预算耗尽，客户端在途任务不被中断。</div>
     </div>
   </div>
   <div class="card">
@@ -900,7 +924,10 @@ function bindSettingsEvents(){
       image_max_capacity:Number(g("s_img_cap")), video_max_capacity:Number(g("s_vid_cap")),
       free_text_rpm:Number(g("s_free_text_rpm")),
       scenario:g("s_scenario"),
-      text_two_level_queue:document.getElementById("s_two_level")?document.getElementById("s_two_level").checked:false
+      text_two_level_queue:document.getElementById("s_two_level")?document.getElementById("s_two_level").checked:false,
+      auto_scenario:document.getElementById("s_auto_scenario")?document.getElementById("s_auto_scenario").checked:false,
+      rate_limit_retry_max:Number(document.getElementById("s_rl_retry_max")?document.getElementById("s_rl_retry_max").value:0),
+      rate_limit_wait_budget_ms:Number(document.getElementById("s_rl_wait_budget_s")?document.getElementById("s_rl_wait_budget_s").value*1000:0)
     };
     MODALITIES.forEach(m=>payload.auto_intent.preferred_models[m] =
       g("s_pref_"+m).split(",").map(x=>x.trim()).filter(Boolean));
@@ -925,6 +952,19 @@ function bindSettingsEvents(){
       await refresh();
     }catch(e){ toast(e.message,"bad"); }
   };
+  const applyRec = document.getElementById("btnApplyRec");
+  if(applyRec){
+    const rec = (state.scenarioData && state.scenarioData.recommend) || null;
+    applyRec.onclick = async ()=>{
+      if(!rec || !rec.name){ toast("暂无推荐（负载数据积累中）","warn"); return; }
+      try{
+        // 推荐情景：一键应用该情景（含其 429 自动重试预算），并保留自动检测开关
+        await api("/api/settings",{method:"POST",body:JSON.stringify({scenario:rec.name, auto_scenario:true})});
+        toast(`已按推荐应用「${rec.name}」情景并开启自动检测`,"good");
+        await refresh();
+      }catch(e){ toast(e.message,"bad"); }
+    };
+  }
   document.getElementById("btnImport").onclick = async ()=>{
     const text = prompt("粘贴导出的 JSON（会追加账号，不覆盖现有）"); if(!text) return;
     try{
@@ -948,6 +988,7 @@ async function refresh(){
     state.logs = logs.logs||[]; state.settings = settings;
     state.jobs = jobs.jobs||[]; state.bindings = bindings.bindings||[];
     state.scenarios = scenarios.scenarios||[];
+    state.scenarioData = scenarios; // 完整响应（含 recommend/auto_scenario/rate_limit_*）
     state.stats.queue = (await api("/api/queue")).queue||[];
     const m = stats.metrics||{};
     document.getElementById("subline").textContent =

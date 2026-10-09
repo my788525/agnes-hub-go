@@ -29,3 +29,6 @@ __pycache__/
 fpk-bundle/
 dist/
 *.exe~
+
+# NAS SSH 公钥（部署用，绝不入库；.workbuddy/memory 仍保留跟踪，仅忽略此密钥文件）
+.workbuddy/nas_ssh_key
