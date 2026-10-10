@@ -51,6 +51,8 @@ type Metrics struct {
 	Spillovers     atomic.Int64
 	BreakerOpened  atomic.Int64
 	BreakerRevived atomic.Int64
+	// Continuations 累计 MAX_TOKENS 截断自动续写轮数（观测截断频率与续写开销）。
+	Continuations  atomic.Int64
 	// PanicsTotal 记录被 recover 兜住并已降级（而非进程崩溃）的 panic 次数，
 	// 供 /metrics 观测与「挂机健康度」判断（见 P0-2）。
 	PanicsTotal atomic.Int64
@@ -1441,6 +1443,7 @@ func (h *Hub) Snapshot() map[string]any {
 			"queue_timeout":   h.Metrics.QueueTimeout.Load(),
 			"queue_overflow":  h.Metrics.QueueOverflow.Load(),
 			"spillovers":      h.Metrics.Spillovers.Load(),
+			"continuations":   h.Metrics.Continuations.Load(),
 			"breaker_opened":  h.Metrics.BreakerOpened.Load(),
 			"breaker_revived": h.Metrics.BreakerRevived.Load(),
 			"wait_ms_total":   h.Metrics.WaitMS.Load(),

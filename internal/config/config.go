@@ -343,6 +343,11 @@ type Settings struct {
 	// 耗尽该预算，期间不透传 429 给客户端，从而不中断客户端的在途任务。
 	// 默认 6；填 0 表示沿用 RetryMax。
 	RateLimitRetryMax int `json:"rate_limit_retry_max"`
+	// ContinuationMaxRounds 是上游响应被 max_tokens 截断（finish_reason=length /
+	// MAX_TOKENS / max_tokens）时，网关内自动「续写」的最大轮数：把已生成的部分
+	// 输出作为 assistant 消息追加回请求再追加 user 续写指令，重新排队发起新一轮
+	// 上游请求并拼接结果，客户端不再因截断而任务中断。0 = 禁用（截断原样透传）。
+	ContinuationMaxRounds int `json:"continuation_max_rounds"`
 	// RateLimitWaitBudgetMS 是 429 内部重试的「总等待预算」（ms）：所有 429 退避 +
 	// 排队等待累计超过它即停止重试并透传最后一次 429。默认 180000（3 分钟）；
 	// 填 0 表示不限（仅在 RateLimitRetryMax 耗尽时停）。防止限流持续时网关挂死。
@@ -447,6 +452,8 @@ func DefaultSettings() Settings {
 		UsageRequestLogBytes: 512,   // 日志「用户完整请求」保留字节上限
 		RateLimitRetryMax:     6,      // 429 网关内部自动重试次数上限（换账号+重新排队）
 		RateLimitWaitBudgetMS: 180000, // 429 内部重试总等待预算 3 分钟，超时才透传
+		// MAX_TOKENS 截断自动续写：默认 2 轮（截断不再打断客户端任务）。
+		ContinuationMaxRounds: 2,
 		// #29：发往上游的请求体默认 gzip 压缩（已验证上游 agnes 兼容解压，见 #29）。
 		UpstreamRequestGzip: true,
 		// 默认剥离客户端注入的 <content_policy> 段以省 token（对 user_query 真实输入零改动）。

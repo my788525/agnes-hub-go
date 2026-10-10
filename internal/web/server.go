@@ -692,6 +692,9 @@ func (s *Server) handleTextish(w http.ResponseWriter, r *http.Request, path stri
 		Body: rawBody,
 		// Stream：客户端要流式时用「空闲看门狗」替代固定墙钟超时，长回答不断流。
 		Stream: wantsStream,
+		// MAX_TOKENS 截断自动续写：文本 chat 路径开启，上游截断时网关内自动
+		// 续写拼接，客户端任务不再中断（生图/视频路径不适用，保持 false）。
+		Continuable: true,
 	}
 	// #20：删除请求受理前的「accepted」双写——排队行为已由 done 记录的
 	// wait_ms / attempts / stream 完整反推，不再为此每请求多一次磁盘写。

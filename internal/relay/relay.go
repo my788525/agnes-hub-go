@@ -353,6 +353,9 @@ type Options struct {
 	// StreamIdleTimeoutMS 无任何新字节时才断开），避免长文本回答被固定的
 	// 整请求墙钟超时中途掐断。非流式请求忽略此字段，仍走 RequestTimeoutMS。
 	Stream bool
+	// Continuable 声明该响应可做 MAX_TOKENS 截断自动续写（文本 chat 路径）。
+	// 仅 OpenAI 兼容格式支持；生图/视频轮询必须为 false。
+	Continuable bool
 }
 
 // Result 是一次转发的产物。
@@ -396,7 +399,37 @@ func (r *Result) ReadAll() []byte {
 }
 
 // Do 带排队 / 重试 / 换账号的转发入口。
+// 外层包一层 MAX_TOKENS 截断自动续写（仅 Continuable 路径）：
+// 上游以 finish_reason=length / MAX_TOKENS 截断时，网关自动追加续写消息、
+// 重新排队再请求并拼接结果，客户端不再因截断而任务中断。
 func Do(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) (*Result, error) {
+	res, err := doOnce(ctx, h, client, opts)
+	if err != nil || !opts.Continuable || res == nil || res.Status >= 400 {
+		return res, err
+	}
+	rounds := h.Settings().ContinuationMaxRounds
+	if rounds <= 0 {
+		return res, err
+	}
+	if opts.Stream {
+		if res.Stream == nil {
+			return res, err
+		}
+		origBodyFor := opts.BodyFor
+		if origBodyFor == nil {
+			b := opts.Body
+			origBodyFor = func(*config.Account) ([]byte, string) { return b, "" }
+		}
+		cs := newContinuationStream(ctx, h, client, opts, res, origBodyFor, rounds)
+		return &Result{Status: res.Status, Header: res.Header, Stream: cs,
+			Account: res.Account, ModelUsed: res.ModelUsed, WaitMS: res.WaitMS, Attempts: res.Attempts}, nil
+	}
+	body := res.ReadAll()
+	return continuationResult(ctx, h, client, opts, res, body), nil
+}
+
+// doOnce 是一次「排队 → 选号 → 上游请求 → 网关内重试」的完整会话（原 Do）。
+func doOnce(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) (*Result, error) {
 	if opts.Method == "" {
 		opts.Method = http.MethodPost
 	}
