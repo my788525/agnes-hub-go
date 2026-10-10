@@ -24,6 +24,26 @@
 - release.py 只推 **tag**，分支要**单独 fast-forward 推送**（勿 `--force-with-lease`，本地远程跟踪过期会被拒）。
 - GitHub 仓库 `my788525/agnes-hub-go`；无 `gh` CLI，用 PAT + REST API。
 
+## 「客户端任务中断」防御体系（v1.0.33~1.0.34，续写/重试总纲）
+核心原则：**除网络故障与上游彻底失效外，任何中断都要在网关内消化**——能续写就续写，能重发就换号重发，绝不把中间态甩给客户端。已覆盖的七条路径：
+1. **429** → 网关内长预算自动重试（换号 + 重新排队 + Retry-After 退避），预算尽才透传。
+2. **MAX_TOKENS 截断**（`length`/`MAX_TOKENS`/`max_tokens`）→ `internal/relay/continuation.go` 自动续写（部分输出作 assistant 上下文 + user 续写指令，重新排队）。
+3. **HTTP 200 但内容不可用**（空内容 / body 内嵌 error / 非法 JSON / 审查类 finish_reason）→ `resilience.go` 的 classifyResponse 判定后**换号重发**（`soft_fail_retry_max` 默认 2）。
+4. **流式隐式截断**（未见任何 finish_reason 就断流）、**中途 error 帧**、**传输异常** → 续写；无产出则用原始请求换号重发（`Exclude` + 断 SessionKey 粘性）。
+5. **402 额度耗尽** → 换号重试（额度按账号）；全部耗尽才交还真实 402。
+6. **无号可用** → 返回最后那次真实上游结果（含 429/402 语义），不甩无信息量的「无可用账号」。
+7. **缺 finish chunk 就断流** → 合成 `finish_reason=stop` + `[DONE]`：client SDK 否则会判「响应未完成」抛错终止任务。
+- **边界铁律**：软失败检测只认 OpenAI/Gemini/Anthropic 三种文本对话结构，**认不出的一律视为可用**（视频轮询 `{status:"queued"}` 无 choices，误判空内容会无限重发，已有测试守住）；只在 Continuable 路径启用；Gemini content 是 `{parts:[{text}]}` 必须单独取。
+- 相关设置：`continuation_max_rounds`(2)、`soft_fail_retry_max`(2)、`stream_auto_resume`(true)。
+- 观测：`/healthz` 的 `continuations` / `soft_fail_retries` / `resumed_streams` / `pending` / `accepted`。
+
+## 排障套路：「客户端转圈但控制台看不出负载」
+1. 先看 `/healthz`：`pending>0` → 请求在网关内（HTTP 层已进入但没走完），去查 upstream；`accepted` 不涨 → 请求压根没到网关，查客户端/网络。
+2. `last_success_age_ms` 是「多久没有流量真正跑通」的第一指标，比 uptime 有用得多。
+3. `ss -tn | grep 4142` 看是否还有连接存活；`raw_capture/` 目录 mtime 是「最近一次收到请求」的旁证（RawCaptureEnabled 开启时）。
+4. 用 curl `-w "TTFB=%{time_starttransfer}s TOTAL=%{time_total}s"` 精确测网关吞吐，避免凭感觉判断慢在哪。
+5. **负载%在低频大任务场景恒接近 0**（单请求 60s 窗口只有 1/60 rps），不能据此判断网关是否空闲——要看 pending/inflight 绝对数（控制台已有「网关正在处理 N 个请求」胶囊）。
+
 ## 全局约定（来自 user memory，跨项目）
 - 源码改动默认自动 push（经代理 + PAT），推送前核查无遗漏源码目录。
 - git commit summary/description 用中文。
