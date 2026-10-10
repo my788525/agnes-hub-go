@@ -1126,6 +1126,7 @@ function drawStack(cv, meta, cols, events){
   }
   const xAt=i=>padL+(n>1?(i/(n-1))*plotW:0);
   let prev=new Array(n).fill(0);
+  const placed=[]; // 已放置标签的位置（防重叠）
   for(let k=0;k<meta.length;k++){
     const cur=new Array(n);
     for(let i=0;i<n;i++){
@@ -1138,30 +1139,33 @@ function drawStack(cv, meta, cols, events){
     ctx.closePath();
     ctx.fillStyle=meta[k].color||"#2f6fd6"; ctx.globalAlpha=.82; ctx.fill(); ctx.globalAlpha=1;
 
-    // 在色块上直接标注账号名：从中间往外找第一个「够厚」的位置，避免每秒左右跳动；
-    // 太窄的带（小于 13px）不画，防止小账号文字叠成一团。
-    const mid=Math.floor(n/2);
-    let li=-1;
-    for(let d=0; d<=mid && li<0; d++){
-      for(const i of (d===0?[mid]:[mid-d,mid+d])){
-        if(i>=0&&i<n&&(cur[i]-prev[i])*plotH>=13){ li=i; break; }
-      }
+    // 在色块上直接标注账号名：选该账号「最厚」的列（尖峰必然标在峰值处，持续流量的
+    // 宽带也稳定落在最厚处，不会每秒左右跳）；带厚 >=8px 才画（文字 11px 高，再薄会
+    // 与上下带的文字叠成一团）。与已放置标签过近时向下偏移一次，仍过近则放弃。
+    let li=-1, best=0;
+    for(let i=0;i<n;i++){
+      const th=(cur[i]-prev[i])*plotH;
+      if(th>best){ best=th; li=i; }
     }
-    if(li>=0){
-      const thick=(cur[li]-prev[li])*plotH;
+    if(li>=0&&best>=8){
       const cx=Math.max(padL+26, Math.min(w-padR-26, xAt(li)));
-      const cy=padT+plotH-(prev[li]+(cur[li]-prev[li])/2)*plotH;
-      let label=meta[k].name||meta[k].id||"";
-      if(label.length>12) label=label.slice(0,11)+"…";
-      ctx.font="600 11px sans-serif";
-      ctx.textAlign="center"; ctx.textBaseline="middle";
-      ctx.lineWidth=3; ctx.lineJoin="round";
-      ctx.strokeStyle="rgba(0,0,0,.45)"; ctx.strokeText(label,cx,cy); // 描边保证浅色带也看得清
-      ctx.fillStyle="#fff"; ctx.fillText(label,cx,cy);
-      if(thick>=30){ // 带宽足够时顺带标百分比
-        const pct=Math.round((cur[li]-prev[li])*100)+"%";
-        ctx.font="10px sans-serif";
-        ctx.strokeText(pct,cx,cy+12); ctx.fillText(pct,cx,cy+12);
+      let cy=padT+plotH-(prev[li]+(cur[li]-prev[li])/2)*plotH;
+      let blocked=placed.find(p=>Math.abs(p.x-cx)<46&&Math.abs(p.y-cy)<13);
+      if(blocked){ cy+=14; blocked=placed.find(p=>Math.abs(p.x-cx)<46&&Math.abs(p.y-cy)<13); }
+      if(!blocked){
+        placed.push({x:cx,y:cy});
+        let label=meta[k].name||meta[k].id||"";
+        if(label.length>12) label=label.slice(0,11)+"…";
+        ctx.font="600 11px sans-serif";
+        ctx.textAlign="center"; ctx.textBaseline="middle";
+        ctx.lineWidth=3; ctx.lineJoin="round";
+        ctx.strokeStyle="rgba(0,0,0,.45)"; ctx.strokeText(label,cx,cy); // 描边保证浅色带也看得清
+        ctx.fillStyle="#fff"; ctx.fillText(label,cx,cy);
+        if(best>=30){ // 带厚足够时顺带标百分比
+          const pct=Math.round((cur[li]-prev[li])*100)+"%";
+          ctx.font="10px sans-serif";
+          ctx.strokeText(pct,cx,cy+12); ctx.fillText(pct,cx,cy+12);
+        }
       }
     }
     prev=cur;
