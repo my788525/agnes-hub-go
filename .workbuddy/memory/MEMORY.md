@@ -19,6 +19,8 @@
 - 版本单一来源：`main.go` 的 `var version = "x.y.z"`；`tools/build_fpk.py` 与 `tools/release.py` 都从它读，勿手改两处。
 - `tools/release.py`：交叉编译 linux-amd64/arm64 + windows exe（前置校验嵌入版本==main.go）→ 打 `baipiao-hub-{ver}.fpk` + `agnes-hub-go-windows-{ver}.zip` → tag v{ver} → GitHub Release + 上传 5 资产。
 - 跑 release.py 用 venv python（`C:/Users/pguoy/.workbuddy/binaries/python/envs/default/Scripts/python.exe`，有 requests）。设 `GITHUB_PAT` 环境变量（绝不入代码），走代理 `http://127.0.0.1:3067`。
+- **Release 正文**：`release_notes()` 优先读 `tools/release_notes.md`（支持 `{{VERSION}}` 占位），缺失才回退内置文案。发版时**只改这个 md，不要再改 release.py**（此前正文硬编码在 py 里，导致长期挂着旧版「上游上下文策略」文案）。
+- 顺序：先把脚本/说明改动本地 commit，再跑 release.py，让 tag 指向含这些改动的 commit。
 - release.py 只推 **tag**，分支要**单独 fast-forward 推送**（勿 `--force-with-lease`，本地远程跟踪过期会被拒）。
 - GitHub 仓库 `my788525/agnes-hub-go`；无 `gh` CLI，用 PAT + REST API。
 
