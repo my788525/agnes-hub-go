@@ -110,6 +110,75 @@ func TestSoftFailRespectsBudget(t *testing.T) {
 	}
 }
 
+// TestSoftFailGiveUpOnBudgetExhausted 软失败预算（soft_fail_retry_max）耗尽后，
+// 网关必须把「无内容的 200」换成带原因的 502，而不是伪装成功透传导致客户端静默挂死。
+func TestSoftFailGiveUpOnBudgetExhausted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body)
+		// 三个号全部返回空内容（无可用产出）
+		fmt.Fprint(w, `{"choices":[{"message":{"content":""},"finish_reason":"stop"}]}`)
+	}))
+	defer srv.Close()
+
+	h, store := newTestHubForRelay(t, func(s *config.Settings) { s.SoftFailRetryMax = 2 })
+	for i := 0; i < 3; i++ {
+		addTestUpstream(t, h, store, srv.URL)
+	}
+
+	res, err := Do(context.Background(), h, srv.Client(),
+		chatOptions([]byte(`{"model":"agnes-2.5-flash","messages":[{"role":"user","content":"hi"}]}`), false))
+	if err != nil {
+		t.Fatalf("Do 失败：%v", err)
+	}
+	defer res.Close()
+	raw := res.ReadAll()
+
+	if res.Status != http.StatusBadGateway {
+		t.Errorf("预算耗尽应返回 502，实际 %d", res.Status)
+	}
+	if !strings.Contains(string(raw), "agnes_upstream_content_unavailable") {
+		t.Errorf("502 应带可识别错误类型，实际：%s", raw)
+	}
+	if h.Metrics.SoftFailRetries.Load() != 2 {
+		t.Errorf("应换号重发 2 次，实际 %d", h.Metrics.SoftFailRetries.Load())
+	}
+	if h.Metrics.SoftFailGaveUp.Load() != 1 {
+		t.Errorf("放弃续救计数应为 1，实际 %d", h.Metrics.SoftFailGaveUp.Load())
+	}
+}
+
+// TestSoftFailGiveUpOnAllExcluded 账号数 ≤ 重发预算、全部返回空内容时，Pick 会
+// 因全部被 exclude 而失败；此时若最后一次正是软失败，仍应转成 502，而非把 200 空内容透传。
+func TestSoftFailGiveUpOnAllExcluded(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body)
+		fmt.Fprint(w, `{"choices":[{"message":{"content":""},"finish_reason":"stop"}]}`)
+	}))
+	defer srv.Close()
+
+	h, store := newTestHubForRelay(t, func(s *config.Settings) { s.SoftFailRetryMax = 2 })
+	addTestUpstream(t, h, store, srv.URL)
+	addTestUpstream(t, h, store, srv.URL)
+
+	res, err := Do(context.Background(), h, srv.Client(),
+		chatOptions([]byte(`{"model":"agnes-2.5-flash","messages":[{"role":"user","content":"hi"}]}`), false))
+	if err != nil {
+		t.Fatalf("Do 失败：%v", err)
+	}
+	defer res.Close()
+	raw := res.ReadAll()
+
+	if res.Status != http.StatusBadGateway {
+		t.Errorf("全 exclude 后也应返回 502，实际 %d", res.Status)
+	}
+	if !strings.Contains(string(raw), "agnes_upstream_content_unavailable") {
+		t.Errorf("502 应带可识别错误类型，实际：%s", raw)
+	}
+	if h.Metrics.SoftFailGaveUp.Load() != 1 {
+		t.Errorf("放弃续救计数应为 1，实际 %d", h.Metrics.SoftFailGaveUp.Load())
+	}
+}
+
 // TestVideoPollShapeNotRefired 视频轮询这类异构响应绝不能被当空内容重发。
 func TestVideoPollShapeNotRefired(t *testing.T) {
 	calls := 0

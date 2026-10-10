@@ -56,6 +56,9 @@ type Metrics struct {
 	// SoftFailRetries 累计「HTTP 200 但内容不可用」的换号重发次数（空内容 /
 	// 内嵌 error / 非法 JSON / 审查类拒绝）——观测上游的隐性失败率。
 	SoftFailRetries atomic.Int64
+	// SoftFailGaveUp 累计「软失败预算耗尽、放弃续救」的次数：此时网关不再把
+	// 无内容的 200 伪装成成功，而是返回带原因的 502 让客户端干净停止。
+	SoftFailGaveUp atomic.Int64
 	// Pending 记录「已进入网关、但还没走完」的转发类请求数（/v1/*）。
 	// 它与 requests_total 之间那段时间（读 body / 解析 / 意图判定）原本完全
 	// 不可见：pending 持续不为 0 说明请求卡在网关内部，是排障「客户端转圈但
@@ -1459,6 +1462,7 @@ func (h *Hub) Snapshot() map[string]any {
 			"spillovers":      h.Metrics.Spillovers.Load(),
 			"continuations":   h.Metrics.Continuations.Load(),
 			"soft_fail_retries": h.Metrics.SoftFailRetries.Load(),
+			"soft_fail_gave_up": h.Metrics.SoftFailGaveUp.Load(),
 			"resumed_streams":   h.Metrics.ResumedStreams.Load(),
 			// 已进入网关但未走完的转发请求数（区分「客户端没发」与「卡在网关内」）
 			"pending":  h.Metrics.Pending.Load(),

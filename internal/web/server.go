@@ -525,6 +525,20 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	sb.WriteString("# TYPE baiPiao_hub_panics_total counter\n")
 	sb.WriteString(fmt.Sprintf("baiPiao_hub_panics_total %d\n", m.PanicsTotal.Load()))
 
+	// 韧性层观测：截断续写 / 软失败换号重发 / 软失败放弃续救（预算耗尽转 502） / 流式恢复。
+	sb.WriteString("# HELP baiPiao_hub_continuations MAX_TOKENS 截断自动续写轮数\n")
+	sb.WriteString("# TYPE baiPiao_hub_continuations counter\n")
+	sb.WriteString(fmt.Sprintf("baiPiao_hub_continuations %d\n", m.Continuations.Load()))
+	sb.WriteString("# HELP baiPiao_hub_soft_fail_retries HTTP 200 但内容不可用的换号重发次数\n")
+	sb.WriteString("# TYPE baiPiao_hub_soft_fail_retries counter\n")
+	sb.WriteString(fmt.Sprintf("baiPiao_hub_soft_fail_retries %d\n", m.SoftFailRetries.Load()))
+	sb.WriteString("# HELP baiPiao_hub_soft_fail_gave_up 软失败预算耗尽、放弃续救并转 502 的次数\n")
+	sb.WriteString("# TYPE baiPiao_hub_soft_fail_gave_up counter\n")
+	sb.WriteString(fmt.Sprintf("baiPiao_hub_soft_fail_gave_up %d\n", m.SoftFailGaveUp.Load()))
+	sb.WriteString("# HELP baiPiao_hub_resumed_streams 流式 auto-resume 次数\n")
+	sb.WriteString("# TYPE baiPiao_hub_resumed_streams counter\n")
+	sb.WriteString(fmt.Sprintf("baiPiao_hub_resumed_streams %d\n", m.ResumedStreams.Load()))
+
 	sb.WriteString("# HELP baiPiao_hub_upstream_429_rate_per_min Upstream 429s in the last 60s\n")
 	sb.WriteString("# TYPE baiPiao_hub_upstream_429_rate_per_min gauge\n")
 	sb.WriteString(fmt.Sprintf("baiPiao_hub_upstream_429_rate_per_min %d\n", h.Upstream429RatePerMin()))

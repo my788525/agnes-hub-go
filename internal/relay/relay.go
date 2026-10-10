@@ -470,6 +470,10 @@ func doOnce(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) 
 	// Pick 无号可用时，返回它而不是「无可用账号」——客户端至少能拿到上游的
 	// 真实原因（例如 429 + Retry-After），而不是一个让任务直接停摆的 502。
 	var lastFail *Result
+	// lastSoftKind 记录 lastFail 是否为「软失败（无内容）」——若所有账号都被
+	// exclude 光导致 Pick 失败，且最后一次正是软失败，则不把它伪装成成功透传，
+	// 同样返回带原因的 502 让客户端干净停止。
+	var lastSoftKind respKind
 	// 记录一次到达，供控制台「到达密度 vs 节拍」观测。
 	h.Arrivals.Add()
 	// #24：记录一次负载画像（模态 + 是否流式），供接入方自动检测匹配情景。
@@ -481,6 +485,12 @@ func doOnce(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) 
 			// 已重试过若干次后被「排除」到无号可用：交还最后那次的真实上游结果，
 			// 而不是让客户端撞上一个毫无信息量的「无可用账号」错误。
 			if lastFail != nil && ctx.Err() == nil {
+				// 但若最后一次失败正是「软失败无内容」，不要把它伪装成成功 200
+				// 透传——同样返回带原因的 502，让客户端干净停止并看到原因。
+				if lastSoftKind.needRefire() {
+					h.Metrics.SoftFailGaveUp.Add(1)
+					return softFailGiveUp(lastFail, lastSoftKind, softUsed+1), nil
+				}
 				return lastFail, nil
 			}
 			return nil, err
@@ -527,18 +537,26 @@ func doOnce(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) 
 					h.Metrics.WaitMS.Add(result.WaitMS)
 					return result, nil
 				}
-				if kind.needRefire() && softUsed < softMax {
-					softUsed++
-					result.Close()
-					h.NoteError(account, "soft_fail: "+kind.String())
-					h.Metrics.RequestsError.Add(1)
-					h.Metrics.SoftFailRetries.Add(1)
+				if kind.needRefire() {
+					if softUsed < softMax {
+						softUsed++
+						result.Close()
+						h.NoteError(account, "soft_fail: "+kind.String())
+						h.Metrics.RequestsError.Add(1)
+						h.Metrics.SoftFailRetries.Add(1)
 					exclude[account.ID] = true
 					lastFail = result
-					// 退避按「软失败自身的轮次」计，不与 5xx 重试共用计数——
-					// 否则一次空内容会把后续延迟推到秒级，客户端白等。
-					sleepBackoff(ctx, s, softUsed-1)
-					continue
+					lastSoftKind = kind
+						// 退避按「软失败自身的轮次」计，不与 5xx 重试共用计数——
+						// 否则一次空内容会把后续延迟推到秒级，客户端白等。
+						sleepBackoff(ctx, s, softUsed-1)
+						continue
+					}
+					// 软失败预算耗尽：不要再把「无内容的 200」伪装成成功透传给
+					// 客户端——那会让客户端吞下空回复却不停止，变成静默挂死。
+					// 改为返回带原因的 502，让客户端干净停止并看到为什么。
+					h.Metrics.SoftFailGaveUp.Add(1)
+					return softFailGiveUp(result, kind, softUsed+1), nil
 				}
 			}
 			if result.Status < 400 {
@@ -583,6 +601,28 @@ func doOnce(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) 
 		h.Metrics.RequestsError.Add(1)
 		h.Metrics.WaitMS.Add(result.WaitMS)
 		return result, nil
+	}
+}
+
+// softFailGiveUp 在软失败预算（soft_fail_retry_max）耗尽后，把「无内容的 200」
+// 换成带原因的 502，让客户端能干净停止并看到原因，而不是吞下空回复后静默挂死。
+// tried 是返回该不可用内容的尝试总次数（首轮 + 已发生的换号重发轮数）。
+func softFailGiveUp(r *Result, kind respKind, tried int) *Result {
+	r.Close()
+	msg := fmt.Sprintf(
+		"agnes-hub: upstream content unavailable after %d account attempt(s) (%s). "+
+			"All tried accounts returned unusable content; please retry or reconfigure accounts.",
+		tried, kind.String())
+	body, _ := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message": msg,
+			"type":    "agnes_upstream_content_unavailable",
+		},
+	})
+	return &Result{
+		Status: http.StatusBadGateway,
+		Header: http.Header{"Content-Type": {"application/json"}},
+		Body:   body,
 	}
 }
 
