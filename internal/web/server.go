@@ -629,6 +629,9 @@ func (s *Server) handleTextish(w http.ResponseWriter, r *http.Request, path stri
 		}
 	}
 
+	// #24 负载画像遥测埋点：每请求记一次模态 + 流式标记，供 LoadProfile/接入方自动检测。
+	s.Hub.NoteRequest(decision.Modality, wantsStream)
+
 	switch decision.Modality {
 	case intent.Image:
 		s.serveAutoImage(w, r, item, body, decision, settings, true, wantsStream)
@@ -717,6 +720,9 @@ func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request, path, modal
 	}
 	requested := strings.TrimSpace(asStr(body["model"]))
 	wantsStream := truthy(body["stream"])
+
+	// #24 负载画像遥测埋点：媒体端点（图像/视频）同样记一次模态 + 流式标记。
+	s.Hub.NoteRequest(modality, wantsStream)
 
 	decision := intent.Decide(path, body, firstNonEmpty(requested, settings.AutoModelName),
 		autoIntentConfig(settings), s.rules, settings.ModelAliases, pool.ModalityOfModel, modality)

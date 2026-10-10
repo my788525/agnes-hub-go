@@ -318,6 +318,14 @@ exit 0
 TRIVIAL = "#!/bin/bash\nexit 0\n"
 
 CHANGELOG = (
+    "1.0.26→1.0.27：完成 #24 负载画像遥测 + #29 RawCapture 原始请求分析。"
+    "① #24 修复此前 NoteRequest 埋点从未被调用的死代码——现在每个请求（文本/图像/视频）"
+    "都会记一次模态 + 流式标记，LoadProfile 真实累加，接入方自动检测（RecommendScenario → "
+    "maybeAutoScenario 自动切换情景）终于生效；新增 TestNoteRequestFeedsLoadProfile / "
+    "TestRecommendScenarioRoutesByProfile 锁死该回归。"
+    "② #29 新增 tools/analyze_captures.py：读取网关 data/raw_capture/*.json（客户端原始请求体，"
+    "未截断/未改写），逐字段盘点路径/类型/频次/取值分布并输出 HTML 全字段分析报告，"
+    "可作为意图判定、content_policy 剥离、content 数组归一化的回归基准。"
     "1.0.25→1.0.26：strip_content_policy 默认开启——网关默认在转发前剥离客户端注入的 "
     "<content_policy> 段以省 token（高轮次会话每轮重复、约 100~400 词），对 <user_query> "
     "真实输入与其余字段零改动；如需保留原始正文送上游可手动关闭（setopt strip_content_policy off）。"

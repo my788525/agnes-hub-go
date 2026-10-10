@@ -545,3 +545,56 @@ func tweakSettings(t *testing.T, h *Hub, store *config.Store, fn func(*config.Se
 	}
 	h.Reload()
 }
+
+// ---------------------------------------------------------------------------
+// #24 负载画像遥测（NoteRequest → LoadProfile → RecommendScenario）
+// ---------------------------------------------------------------------------
+
+// TestNoteRequestFeedsLoadProfile 每请求埋点必须真实累加到 LoadProfile：
+// 这是「接入方自动检测」能跑起来的前提（此前 NoteRequest 未被调用，画像恒为空）。
+func TestNoteRequestFeedsLoadProfile(t *testing.T) {
+	h, _ := newTestHub(t, nil)
+	h.NoteRequest("text", true)
+	h.NoteRequest("text", false)
+	h.NoteRequest("image", false)
+
+	p := h.LoadProfile()
+	if p.TotalRecent != 3 {
+		t.Fatalf("TotalRecent 应为 3，实际 %d", p.TotalRecent)
+	}
+	if math.Abs(p.TextRatio-2.0/3.0) > 1e-9 {
+		t.Errorf("TextRatio 应为 2/3，实际 %v", p.TextRatio)
+	}
+	if math.Abs(p.ImageRatio-1.0/3.0) > 1e-9 {
+		t.Errorf("ImageRatio 应为 1/3，实际 %v", p.ImageRatio)
+	}
+	// 流式比只对文本请求有意义：2 条文本里 1 条流式 → 0.5
+	if math.Abs(p.StreamRatio-0.5) > 1e-9 {
+		t.Errorf("StreamRatio 应为 0.5，实际 %v", p.StreamRatio)
+	}
+}
+
+// TestRecommendScenarioRoutesByProfile RecommendScenario 是纯函数，必须按画像
+// 稳定映射到对应情景（高 429→batch、生图高→image、视频高→auto、
+// 文本多并发→workbuddy、纯文本低并发→code、空负载→default）。
+func TestRecommendScenarioRoutesByProfile(t *testing.T) {
+	cases := []struct {
+		name string
+		in   config.LoadProfile
+		want string
+	}{
+		{"空负载回落 default", config.LoadProfile{}, "default"},
+		{"高 429 → batch", config.LoadProfile{TotalRecent: 10, Upstream429Rate: 5}, "batch"},
+		{"生图占比高 → image", config.LoadProfile{TotalRecent: 10, ImageRatio: 0.5}, "image"},
+		{"视频占比高 → auto", config.LoadProfile{TotalRecent: 10, VideoRatio: 0.5}, "auto"},
+		{"文本为主+流式 → workbuddy", config.LoadProfile{TotalRecent: 10, TextRatio: 0.9, StreamRatio: 0.6}, "workbuddy"},
+		{"纯文本低并发 → code", config.LoadProfile{TotalRecent: 10, TextRatio: 1.0}, "code"},
+		{"不偏向 → default", config.LoadProfile{TotalRecent: 10, TextRatio: 0.5, ImageRatio: 0.3, VideoRatio: 0.2}, "default"},
+	}
+	for _, c := range cases {
+		preset, reason := config.RecommendScenario(c.in)
+		if preset.Name != c.want {
+			t.Errorf("[%s] 期望情景 %s，实际 %s（reason=%s）", c.name, c.want, preset.Name, reason)
+		}
+	}
+}
