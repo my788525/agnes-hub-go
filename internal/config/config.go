@@ -348,6 +348,16 @@ type Settings struct {
 	// 输出作为 assistant 消息追加回请求再追加 user 续写指令，重新排队发起新一轮
 	// 上游请求并拼接结果，客户端不再因截断而任务中断。0 = 禁用（截断原样透传）。
 	ContinuationMaxRounds int `json:"continuation_max_rounds"`
+	// SoftFailRetryMax 是「HTTP 200 但内容不可用」时的换号重发次数上限。
+	// 这类失败（空内容 / body 内嵌 error / 非法 JSON / 审查类 finish_reason）
+	// 状态码正常，但客户端一收到就停，故网关应换成另一个号重发一轮。
+	// 默认 2；填 0 = 恢复旧行为（原样透传）。仅对文本 chat 路径生效，
+	// 视频轮询等异构响应结构不会被误判（认不出的结构一律视为可用）。
+	SoftFailRetryMax int `json:"soft_fail_retry_max"`
+	// StreamAutoResume 开启后，流式 SSE 在「未见 finish_reason 就断流 /
+	// 中途出现 error 帧 / 传输层异常」时，网关自动重连续写（不是把异常抛给
+	// 客户端），预算受 ContinuationMaxRounds 约束。默认 true。
+	StreamAutoResume bool `json:"stream_auto_resume"`
 	// RateLimitWaitBudgetMS 是 429 内部重试的「总等待预算」（ms）：所有 429 退避 +
 	// 排队等待累计超过它即停止重试并透传最后一次 429。默认 180000（3 分钟）；
 	// 填 0 表示不限（仅在 RateLimitRetryMax 耗尽时停）。防止限流持续时网关挂死。
@@ -454,6 +464,10 @@ func DefaultSettings() Settings {
 		RateLimitWaitBudgetMS: 180000, // 429 内部重试总等待预算 3 分钟，超时才透传
 		// MAX_TOKENS 截断自动续写：默认 2 轮（截断不再打断客户端任务）。
 		ContinuationMaxRounds: 2,
+		// 「200 但内容不可用」最多换号重发 2 次（加上首发共 3 次尝试）
+		SoftFailRetryMax: 2,
+		// 流式断流 / error 帧自动重连续写，默认开（不让客户端停）
+		StreamAutoResume: true,
 		// #29：发往上游的请求体默认 gzip 压缩（已验证上游 agnes 兼容解压，见 #29）。
 		UpstreamRequestGzip: true,
 		// 默认剥离客户端注入的 <content_policy> 段以省 token（对 user_query 真实输入零改动）。

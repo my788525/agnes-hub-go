@@ -52,7 +52,21 @@ type Metrics struct {
 	BreakerOpened  atomic.Int64
 	BreakerRevived atomic.Int64
 	// Continuations 累计 MAX_TOKENS 截断自动续写轮数（观测截断频率与续写开销）。
-	Continuations  atomic.Int64
+	Continuations atomic.Int64
+	// SoftFailRetries 累计「HTTP 200 但内容不可用」的换号重发次数（空内容 /
+	// 内嵌 error / 非法 JSON / 审查类拒绝）——观测上游的隐性失败率。
+	SoftFailRetries atomic.Int64
+	// Pending 记录「已进入网关、但还没走完」的转发类请求数（/v1/*）。
+	// 它与 requests_total 之间那段时间（读 body / 解析 / 意图判定）原本完全
+	// 不可见：pending 持续不为 0 说明请求卡在网关内部，是排障「客户端转圈但
+	// 控制台看不出任何负载」的第一现场。
+	Pending atomic.Int64
+	// Accepted 累计收到的转发类请求数（含尚未走完的），与 requests_total 的
+	// 差值即为「已到达但未进入 relay」的数量。
+	Accepted atomic.Int64
+	// ResumedStreams 累计流式 auto-resume 次数（SSE 未正常结束即断流 / 中途
+	// error 帧 / 传输层异常时自动重连续写），观测上游断流的频繁程度。
+	ResumedStreams atomic.Int64
 	// PanicsTotal 记录被 recover 兜住并已降级（而非进程崩溃）的 panic 次数，
 	// 供 /metrics 观测与「挂机健康度」判断（见 P0-2）。
 	PanicsTotal atomic.Int64
@@ -1444,6 +1458,11 @@ func (h *Hub) Snapshot() map[string]any {
 			"queue_overflow":  h.Metrics.QueueOverflow.Load(),
 			"spillovers":      h.Metrics.Spillovers.Load(),
 			"continuations":   h.Metrics.Continuations.Load(),
+			"soft_fail_retries": h.Metrics.SoftFailRetries.Load(),
+			"resumed_streams":   h.Metrics.ResumedStreams.Load(),
+			// 已进入网关但未走完的转发请求数（区分「客户端没发」与「卡在网关内」）
+			"pending":  h.Metrics.Pending.Load(),
+			"accepted": h.Metrics.Accepted.Load(),
 			"breaker_opened":  h.Metrics.BreakerOpened.Load(),
 			"breaker_revived": h.Metrics.BreakerRevived.Load(),
 			"wait_ms_total":   h.Metrics.WaitMS.Load(),

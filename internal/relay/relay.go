@@ -356,6 +356,9 @@ type Options struct {
 	// Continuable 声明该响应可做 MAX_TOKENS 截断自动续写（文本 chat 路径）。
 	// 仅 OpenAI 兼容格式支持；生图/视频轮询必须为 false。
 	Continuable bool
+	// Exclude 是本次转发要排除的账号 ID（用于「同一条流换号重发」，避免又
+	// 挑回刚刚失败的那个号）。由续写层在「本段没有任何产出」的场景下设置。
+	Exclude map[string]bool
 }
 
 // Result 是一次转发的产物。
@@ -449,9 +452,24 @@ func doOnce(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) 
 	rateLimitBudgetMS := int64(s.RateLimitWaitBudgetMS)
 
 	exclude := map[string]bool{}
+	for id := range opts.Exclude {
+		exclude[id] = true
+	}
 	var totalWait int64
 	var rl429Used int    // 已用 429 内部重试次数
 	var rl429WaitMS int64 // 429 内部重试累计退避等待（ms），受预算约束
+	// softUsed：「HTTP 200 但内容不可用」的换号重发次数（空内容 / 内嵌 error /
+	// 非法 JSON / 审查类拒绝）。这类失败比错误码更隐蔽——客户端一收到就停，
+	// 网关必须自己换号再试，实在没有号可用才把最后的结果交出去。
+	var softUsed int
+	softMax := s.SoftFailRetryMax
+	if softMax < 0 {
+		softMax = 0
+	}
+	// lastFail 记录最近一次可重试失败的真实结果。当所有候选都被 exclude 光、
+	// Pick 无号可用时，返回它而不是「无可用账号」——客户端至少能拿到上游的
+	// 真实原因（例如 429 + Retry-After），而不是一个让任务直接停摆的 502。
+	var lastFail *Result
 	// 记录一次到达，供控制台「到达密度 vs 节拍」观测。
 	h.Arrivals.Add()
 	// #24：记录一次负载画像（模态 + 是否流式），供接入方自动检测匹配情景。
@@ -460,6 +478,11 @@ func doOnce(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) 
 	for attempt := 0; ; attempt++ {
 		picked, err := h.Pick(opts.SessionKey, opts.PoolClass, opts.Pinned, opts.RequiredModel, exclude)
 		if err != nil {
+			// 已重试过若干次后被「排除」到无号可用：交还最后那次的真实上游结果，
+			// 而不是让客户端撞上一个毫无信息量的「无可用账号」错误。
+			if lastFail != nil && ctx.Err() == nil {
+				return lastFail, nil
+			}
 			return nil, err
 		}
 		account := picked.Account
@@ -489,6 +512,35 @@ func doOnce(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) 
 		}
 
 		if !retry {
+			// ── 韧性层：HTTP < 400 但「内容不可用」时换号重发 ──────────────
+			// 空内容 / body 内嵌 error / 非法 JSON / 审查类拒绝，这些都会有合法
+			// 状态码，但客户端一收到就停。网关必须自己换号再试一轮。
+			// 仅对 Continuable（文本 chat）生效：视频轮询的 {status:"queued"}
+			// 没有 choices，一旦放行会被误判成「空内容」无限重发。
+			if result.Status < 400 && opts.Continuable && !opts.Stream && softMax > 0 {
+				raw := result.ReadAll()
+				result.Body = raw
+				kind := classifyResponse(raw)
+				if kind == respTruncated {
+					// max_tokens 截断：重发同一请求还是在同一处截断，
+					// 必须交给外层「自动续写」，这里直接返回。
+					h.Metrics.WaitMS.Add(result.WaitMS)
+					return result, nil
+				}
+				if kind.needRefire() && softUsed < softMax {
+					softUsed++
+					result.Close()
+					h.NoteError(account, "soft_fail: "+kind.String())
+					h.Metrics.RequestsError.Add(1)
+					h.Metrics.SoftFailRetries.Add(1)
+					exclude[account.ID] = true
+					lastFail = result
+					// 退避按「软失败自身的轮次」计，不与 5xx 重试共用计数——
+					// 否则一次空内容会把后续延迟推到秒级，客户端白等。
+					sleepBackoff(ctx, s, softUsed-1)
+					continue
+				}
+			}
 			if result.Status < 400 {
 				h.NoteSuccess(account)
 				h.OnSuccess(account, opts.PoolClass)
@@ -505,6 +557,7 @@ func doOnce(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) 
 		}
 
 		exclude[account.ID] = true
+		lastFail = result
 
 		// #25：429（限流/达到最大额度）走「网关内长预算自动重试」——换账号 + 重新排队 +
 		// 感知 Retry-After 退避，直到成功或预算耗尽，期间不透传 429 给客户端，
@@ -649,7 +702,9 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	}
 
 	if status == 402 {
-		// 402 Payment Required：额度耗尽，不熔断（等待复活即可），但记录错误不重试
+		// 402 Payment Required：该账号额度耗尽。不再「不重试」——
+		// 额度是【按账号】的，池子里别的号往往还有额度，必须换号再试；
+		// 全部耗尽后 Pick 会失败，由 doOnce 交还最后那次真实的 402。
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
 		if wd != nil {
@@ -662,7 +717,7 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 		return &Result{
 			Status: status, Header: SanitizeHeaders(resp.Header), Body: raw,
 			Account: account, ModelUsed: modelUsed, WaitMS: totalWaitMS, Attempts: attemptNo,
-		}, false, nil // 402 不重试
+		}, true, nil
 	}
 
 	if AuthFailStatus[status] { // 401 / 403

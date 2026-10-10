@@ -29,7 +29,7 @@ import (
 	"agneshub/internal/web"
 )
 
-var version = "1.0.33"
+var version = "1.0.34"
 
 func env(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -137,6 +137,14 @@ func main() {
 		Addr:              addr,
 		Handler:           srv,
 		ReadHeaderTimeout: 20 * time.Second,
+		// ReadTimeout 覆盖「读取整个请求体」的时间上限。此前未设置，意味着：
+		// 客户端一旦没能把自己声明的请求体发完（连接假死 / 超大上下文传输中断 /
+		// 中间代理掐断），handler 会一直阻塞在 io.ReadAll(r.Body) 上——
+		// goroutine 永久泄漏，客户端那边一直转圈，而网关的所有指标都显示「什么都没发生」
+		// （requests_total 不涨、用量日志不写、控制台负载为 0），排障时极易误判成
+		// 「请求根本没到网关」。这里给一个远大于正常上传耗时的上限兜底。
+		// 注意它只约束【请求体的读取】，不影响流式 SSE 的响应写出时长。
+		ReadTimeout: 5 * time.Minute,
 		// 刻意不设 WriteTimeout / IdleTimeout 上限：
 		// 视频提交与长回答的 SSE 流可能持续很久，超时会把正常任务掐断。
 		IdleTimeout: 120 * time.Second,

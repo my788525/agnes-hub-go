@@ -34,6 +34,10 @@ type HistorySample struct {
 	DoneRPS    float64     `json:"done_rps"`   // 完成 req/s（差分）
 	QueueDepth int         `json:"queue_depth"`
 	Inflight   int         `json:"inflight"`
+	// Pending 是「已进网关但还没走完」的转发请求数（读 body / 解析 / 意图判定 /
+	// 排队 / 上游往返全算在内）。它是「低频大请求」场景下唯一能看出网关在干活的
+	// 指标——负载百分比在这种场景恒接近 0，极易被误读成「网关没收到请求」。
+	Pending int         `json:"pending"`
 	R429PM     int         `json:"r429_pm"`
 	Events     int         `json:"events"` // 位掩码：1=429 事件, 2=熔断打开
 	Acc        []AccSample `json:"acc"`
@@ -170,6 +174,7 @@ func (hi *History) sample(h *Hub) {
 		DoneRPS:    round2(doneRPS),
 		QueueDepth: h.QueueDepth(),
 		Inflight:   h.InflightTotal(),
+		Pending:    int(h.Metrics.Pending.Load()),
 		R429PM:     h.Upstream429RatePerMin(),
 		Events:     events,
 		Acc:        acc,
@@ -191,6 +196,11 @@ func (hi *History) sample(h *Hub) {
 	ca.sum.Inflight += s.Inflight
 	ca.sum.R429PM += s.R429PM
 	ca.sum.Events |= s.Events
+	// pending 是「有没有请求卡在网关里」的信号，取窗口峰值而非平均值：
+	// 平均会把一次短促的卡顿稀释成 0.1 再取整抹掉，正是我们要抓的东西。
+	if s.Pending > ca.sum.Pending {
+		ca.sum.Pending = s.Pending
+	}
 	if ca.accDone == nil {
 		ca.accDone = map[string]int64{}
 	}
@@ -209,6 +219,7 @@ func (hi *History) sample(h *Hub) {
 			DoneRPS:    round2(ca.sum.DoneRPS / div),
 			QueueDepth: ca.sum.QueueDepth / ca.n,
 			Inflight:   ca.sum.Inflight / ca.n,
+			Pending:    ca.sum.Pending, // 峰值，不平均
 			R429PM:     int(float64(ca.sum.R429PM) / div),
 			Events:     ca.sum.Events,
 			Acc:        make([]AccSample, 0, len(ca.accDone)),
@@ -264,6 +275,7 @@ func (h *Hub) MetricsHistory(win string) map[string]any {
 		out = append(out, map[string]any{
 			"ts": p.TS, "load_pct": p.LoadPct, "arrive_rps": p.ArriveRPS,
 			"done_rps": p.DoneRPS, "queue_depth": p.QueueDepth, "inflight": p.Inflight,
+			"pending": p.Pending,
 			"r429_pm": p.R429PM, "events": p.Events, "acc": accOut,
 		})
 	}

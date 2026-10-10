@@ -27,6 +27,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"agneshub/internal/config"
 	"agneshub/internal/hub"
@@ -115,7 +116,9 @@ func partialText(body []byte, format string) string {
 	case "gemini":
 		if cands, ok := m["candidates"].([]any); ok && len(cands) > 0 {
 			if c, ok := cands[0].(map[string]any); ok {
-				return anyContentToString(c["content"])
+				// Gemini content 形如 {"role":"model","parts":[{"text":...}]}，
+				// 与 OpenAI 的 string/blocks 不同形，必须用 geminiText 取。
+				return geminiText(c["content"])
 			}
 		}
 	case "anthropic":
@@ -337,6 +340,10 @@ type sseFilter struct {
 	finishReason string
 	partial      strings.Builder
 	sawOpenAI    bool
+	// ---- 韧性：识别「这一段没能正常产出」的各种形态 ----
+	readErr     error  // 传输层读异常（连接重置 / 看门狗超时），非 io.EOF
+	upstreamErr bool   // 中途出现 {"error":...} 帧
+	blocked     bool   // finish_reason 为审查类（content_filter / SAFETY ...）
 }
 
 func newSSEFilter(r io.Reader) *sseFilter {
@@ -372,6 +379,12 @@ func (f *sseFilter) fill() bool {
 			f.emit(line)
 			continue
 		}
+		// 中途 error 帧：吞掉。客户端收到就会中断在途任务，所以由网关自己
+		// 决定「重发一轮」还是「续写」，不把错误外泄。
+		if ev, ok := chunk["error"]; ok && ev != nil {
+			f.upstreamErr = true
+			continue
+		}
 		choices, ok := chunk["choices"].([]any)
 		if !ok {
 			// usage-only 收尾帧（stream_options.include_usage）等：原样下发
@@ -388,6 +401,9 @@ func (f *sseFilter) fill() bool {
 				if fr, _ := c["finish_reason"].(string); fr != "" {
 					f.finishReason = fr
 					f.finish = append([]byte(line), '\n')
+					if fr != "length" && blocksContent[fr] {
+						f.blocked = true
+					}
 					continue // 吞掉 finish chunk，收尾时决定是否补发
 				}
 			}
@@ -424,6 +440,7 @@ type continuationStream struct {
 	opts        Options
 	origBodyFor func(*config.Account) ([]byte, string)
 	rounds      int
+	resume      bool // StreamAutoResume：断流/error 帧/异常时自动重连续写
 
 	round  int
 	cur    *Result
@@ -437,22 +454,62 @@ func newContinuationStream(ctx context.Context, h *hub.Hub, client *http.Client,
 		ctx: ctx, h: h, client: client, opts: opts,
 		origBodyFor: origBodyFor, rounds: rounds,
 		cur: first, f: newSSEFilter(first.Stream),
+		resume: h.Settings().StreamAutoResume,
 	}
 }
 
-// advance 结束当前段并切换到续写段。返回 false 表示无法继续（应收尾）。
-func (c *continuationStream) advance() bool {
-	partial := c.f.partial.String()
-	if strings.TrimSpace(partial) == "" {
+// shouldResume 判定当前段「没能正常产出」是否值得再拉一轮。
+//
+// 前提：客户端还没拿到完整答案，网关此时收尾就等于让它的任务停在中途。
+// 只在 OpenAI 风格 SSE 上介入（认不出的格式一律原样透传，零回归）。
+func (c *continuationStream) shouldResume() bool {
+	if !c.resume || c.round >= c.rounds {
 		return false
 	}
+	if c.ctx != nil && c.ctx.Err() != nil {
+		return false // 客户端已断开，不再徒劳重发
+	}
+	if !c.f.sawOpenAI {
+		return false // 非 OpenAI SSE 格式：不改动，保持原样
+	}
+	partial := strings.TrimSpace(c.f.partial.String())
+	switch {
+	case c.f.finishReason == "length":
+		return true // 明确被 max_tokens 截断 → 续写
+	case c.f.upstreamErr:
+		return true // 中途 error 帧 → 有产出就续写，没产出就整轮重发
+	case c.f.readErr != nil:
+		return true // 传输层异常（连接重置 / 空闲超时）→ 同上
+	case c.f.blocked:
+		return partial == "" // 审查类拒绝：内容已吐给客户端就不再续写（会重复）；空产出则换号重试
+	case c.f.finishReason == "":
+		return true // 未见任何 finish_reason 就断流——上游隐式截断/空流
+	}
+	return false
+}
+
+// advance 结束当前段并切换到下一轮。返回 false 表示无法继续（应收尾）。
+func (c *continuationStream) advance() bool {
+	partial := strings.TrimSpace(c.f.partial.String())
 	if c.round >= c.rounds {
 		return false
 	}
 	prev := c.cur
+	prevAcc := ""
+	if prev != nil && prev.Account != nil {
+		prevAcc = prev.Account.ID
+	}
 	c.round++
 	noteContinuation(c.h)
-	next, err := doOnceWithContinuation(c.ctx, c.h, c.client, c.opts, c.origBodyFor, partial)
+	var next *Result
+	var err error
+	if partial == "" {
+		// 本段毫无产出（空流 / 一上来就是 error / 连接即失败）：
+		// 不能追加续写消息（没有前缀可续），改用原始请求换号重发一轮。
+		next, err = refireOnce(c.ctx, c.h, c.client, c.opts, c.origBodyFor, prevAcc)
+	} else {
+		next, err = doOnceWithContinuation(c.ctx, c.h, c.client, c.opts, c.origBodyFor, partial)
+	}
 	if err != nil || next == nil || next.Status >= 400 || next.Stream == nil {
 		if next != nil {
 			next.Close()
@@ -467,6 +524,18 @@ func (c *continuationStream) advance() bool {
 	return true
 }
 
+// refireOnce 用【原始请求】重发一轮并跳过刚失败的号（避免又粘回同一个号）。
+func refireOnce(ctx context.Context, h *hub.Hub, client *http.Client,
+	opts Options, origBodyFor func(*config.Account) ([]byte, string), excludeAcc string) (*Result, error) {
+	wrapped := Options(opts)
+	wrapped.BodyFor = origBodyFor
+	wrapped.SessionKey = "" // 断粘性：本就是要换一个号
+	if excludeAcc != "" {
+		wrapped.Exclude = map[string]bool{excludeAcc: true}
+	}
+	return doOnce(ctx, h, client, wrapped)
+}
+
 func (c *continuationStream) Read(p []byte) (int, error) {
 	for {
 		if c.closed {
@@ -479,8 +548,14 @@ func (c *continuationStream) Read(p []byte) (int, error) {
 		if err == nil {
 			continue
 		}
-		// 当前段 EOF：决定续写或收尾
-		if c.f.finishReason == "length" && c.advance() {
+		if err != io.EOF {
+			c.f.readErr = err // 传输层异常（连接重置 / 空闲看门狗超时）
+		}
+		// 当前段结束：能续就续，否则收尾。
+		if c.shouldResume() && c.advance() {
+			if c.round == 1 && c.h != nil {
+				c.h.Metrics.ResumedStreams.Add(1)
+			}
 			// SSE 注释帧：对客户端不可见，但让连接保持活跃并便于抓包观察
 			comment := fmt.Sprintf(": agnes-hub continuation round %d\n\n", c.round)
 			if len(p) >= len(comment) {
@@ -489,10 +564,17 @@ func (c *continuationStream) Read(p []byte) (int, error) {
 			}
 			continue
 		}
-		// 收尾：补发缓存的 finish chunk（stop / length 都要给客户端）+ [DONE]
+		// 收尾：必须给客户端一个规范的结束信号。
+		// 缺了这一步，openai-python / openai-node 会把「没有 finish_reason
+		// 也没收到 [DONE] 就断开」当成连接错误抛给上层——正是「任务中途停止」
+		// 最常见的表现。所以即便这一段是被错误中断的，也要合成一个 stop 帧。
 		var tail []byte
 		if c.f.sawOpenAI {
-			tail = append(tail, c.f.finish...)
+			if len(c.f.finish) > 0 {
+				tail = append(tail, c.f.finish...)
+			} else {
+				tail = append(tail, synthFinishChunk(cstreamModel(c.cur, c.opts))...)
+			}
 			tail = append(tail, []byte("data: [DONE]\n\n")...)
 		}
 		c.closeCurrent()
@@ -514,6 +596,40 @@ func (c *continuationStream) closeCurrent() {
 		c.cur.Close()
 		c.cur = nil
 	}
+}
+
+// cstreamModel 取当前段实际使用的模型名（用于合成结束帧）。
+func cstreamModel(cur *Result, opts Options) string {
+	if cur != nil && cur.ModelUsed != "" {
+		return cur.ModelUsed
+	}
+	return opts.RequiredModel
+}
+
+// synthFinishChunk 合成一个 OpenAI 规范的收尾 chunk。
+//
+// 上游 SSE 被中断（error 帧 / 连接重置 / 空闲超时）时不会有 finish chunk，
+// 客户端 SDK 会因此判定「响应未完成」并抛错中断任务。网关补一个 finish_reason=stop
+// 把这段体面地收掉：内容可能不完整，但客户端的任务不会停在中途。
+func synthFinishChunk(model string) []byte {
+	payload := map[string]any{
+		"id":      "agnes-hub-resume",
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []any{map[string]any{
+			"index":         0,
+			"delta":         map[string]any{},
+			"finish_reason": "stop",
+		}},
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return []byte("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+	}
+	out := append([]byte("data: "), b...)
+	out = append(out, '\n', '\n')
+	return out
 }
 
 func (c *continuationStream) Close() error {

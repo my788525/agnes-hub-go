@@ -113,6 +113,13 @@
   background:#fff;color:var(--sub,#5b6573);font-size:12px;font-weight:600;cursor:pointer}
 .live-head .win-pill.on{background:var(--blue,#2f6fd6);color:#fff;border-color:var(--blue,#2f6fd6)}
 .live-head .live-dot{width:9px;height:9px;border-radius:50%;background:var(--green,#2f9e6f);
+  box-shadow:0 0 0 3px rgba(47,158,111,.18);animation:livepulse 2s ease-in-out infinite}
+/* 「网关正在处理 N 个请求」——低频大任务时负载百分比恒接近 0，
+   这个小胶囊是唯一能直接看出网关在不在干活的地方。 */
+.live-head .busy-pill{font-size:12px;padding:3px 11px;border-radius:999px;border:1px solid transparent;white-space:nowrap}
+.live-head .busy-idle{background:var(--surface2,#f1f4f9);color:var(--muted,#8b949e);border-color:var(--line,#e3e8ef)}
+.live-head .busy-on{background:rgba(47,111,214,.12);color:var(--blue,#2f6fd6);border-color:rgba(47,111,214,.35);font-weight:600}
+.live-head .busy-warn{background:rgba(224,138,30,.14);color:#b26f10;border-color:rgba(224,138,30,.4);font-weight:600}
   box-shadow:0 0 0 0 rgba(47,158,111,.6);animation:pulse 1.4s infinite}
 @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(47,158,111,.5)}70%{box-shadow:0 0 0 7px rgba(47,158,111,0)}100%{box-shadow:0 0 0 0 rgba(47,158,111,0)}}
 .live-card{background:var(--card,#fff);border:1px solid var(--line,#e3e8ef);border-radius:14px;
@@ -1018,6 +1025,7 @@ function liveSection(){
       <h2 style="margin:0">运行实况 · 实时</h2>
       <span class="live-dot" title="每秒自动采样，图表自动滚动，无需手动刷新"></span>
       <span class="muted" style="font-size:12px">每秒采样 · 不刷新页面 · 自动滚动（${w}）</span>
+      <span id="liveBusy" class="busy-pill busy-idle" title="正在被网关处理的请求：排队中 + 上游在途 + 还未进入转发的（读请求体/解析/意图判定）">网关空闲</span>
       <div style="flex:1"></div>
       ${["30s","60s","5m","1h"].map(x=>`<button class="win-pill ${LIVE.win===x?"on":""}" data-win="${x}">${x}</button>`).join("")}
     </div>
@@ -1217,6 +1225,21 @@ function drawLive(){
   }
   const events=slice.map(p=>p.events||0);
 
+  // 「网关正在干活吗」——低频大任务时负载率恒接近 0，这里用绝对数说话。
+  // pending = 所有已进网关但还没走完的请求（含读请求体/排队/上游往返）。
+  const last0=slice[slice.length-1]||{};
+  const busy=(last0.pending||0)+(last0.queue_depth||0)+(last0.inflight||0);
+  const busyEl=document.getElementById("liveBusy");
+  if(busyEl){
+    const half=Math.max(1,Math.round(slice.length/2));
+    const sustained=slice.slice(-half).every(p=>((p.pending||0)+(p.inflight||0))>0);
+    busyEl.className="busy-pill "+(busy===0?"busy-idle":(sustained?"busy-warn":"busy-on"));
+    busyEl.textContent = busy===0?"网关空闲":`网关正在处理 ${busy} 个请求`;
+    busyEl.title = sustained
+      ? "连续多个采样点都有请求没走完——若客户端一直在等，说明请求卡在网关内（见 healthz 的 pending）"
+      : "正在被处理的请求数：待转发 + 排队 + 上游在途";
+  }
+
   // ① 负载率
   const load=slice.map(p=>p.load_pct||0);
   const cur=load[load.length-1]||0;
@@ -1244,8 +1267,9 @@ function drawLive(){
   document.getElementById("roScale").innerHTML=
     `<div><b style="color:#2f6fd6">${(last.arrive_rps||0).toFixed(1)}</b><span>到达 req/s</span></div>
      <div><b style="color:#2f9e6f">${(last.done_rps||0).toFixed(1)}</b><span>完成 req/s</span></div>
-     <div><b style="color:#7a52c7">${last.inflight||0}</b><span>在途</span></div>
+     <div><b style="color:#7a52c7">${last.inflight||0}</b><span>上游在途</span></div>
      <div><b style="color:#e08a1e">${last.queue_depth||0}</b><span>排队</span></div>
+     <div><b>${last.pending||0}</b><span>待转发</span></div>
      <div><b>${last.r429_pm||0}</b><span>429/分钟</span></div>`;
 
   // ③ 多账号分配（动态直方图）

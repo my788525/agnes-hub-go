@@ -69,6 +69,20 @@ func (s *Server) UpdaterInstance() *updater.Updater { return s.Updater }
 // 在途任务。这里是「挂机无人值守」的地基。
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer recoverHandler(s, w, r)
+	// 转发类端点（/v1/*）在这里记一次「已进入网关」。
+	//
+	// 为什么必须要有这个计数：请求从到达 HTTP 层到真正进入 relay.Do（那里才有的
+	// requests_total / 到达密度 / 用量日志）之间存在一段**完全不可观测的窗口**——
+	// 读取请求体、JSON 解析、意图判定。若连接在这里卡住（客户端没有把 body 发完、
+	// 超大上下文传输中断等），所有下游指标都会显示「什么都没发生」，控制台负载为 0，
+	// 而客户端那边一直转圈。有了 pending/accepted，就能一眼区分：
+	//   - pending = 0 且 accepted 不涨 → 请求压根没到网关（看客户端/网络）
+	//   - pending 持续 > 0           → 卡在网关内的某个环节（看这段代码之间）
+	if strings.HasPrefix(r.URL.Path, "/v1/") && s.Hub != nil {
+		s.Hub.Metrics.Pending.Add(1)
+		s.Hub.Metrics.Accepted.Add(1)
+		defer s.Hub.Metrics.Pending.Add(-1)
+	}
 	s.mux.ServeHTTP(w, r)
 }
 
@@ -365,6 +379,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"last_success_age_ms": lastSuccessAgeMS,
 		"upstream_429_rate_per_min": s.Hub.Upstream429RatePerMin(),
 		"panics_total":       s.Hub.PanicsTotal(),
+		// 「请求到网关了吗？」的第一现场。请求从进来（这里计数）到真正进入 relay
+		// （那里的 requests_total / 到达密度）之间有一段原本完全不可见的窗口：
+		// 读请求体、JSON 解析、意图判定。pending 持续不为 0 说明卡在这段里，
+		// accepted 不涨则说明请求压根没到网关。
+		"pending":  s.Hub.Metrics.Pending.Load(),
+		"accepted": s.Hub.Metrics.Accepted.Load(),
 		// #21 排队可观测：此刻发起一次文本请求，预计要排队等多久（取 text 池所有
 		// 启用账号 pacer 的最大投影等待）。探活脚本可据此预判「会不会堵」。
 		"text_projected_wait_ms": s.Hub.PoolMaxProjectedWaitMS("text"),
