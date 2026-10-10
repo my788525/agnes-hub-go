@@ -183,6 +183,34 @@ func TestStickyBindingKeptWhenHealthy(t *testing.T) {
 	}
 }
 
+// TestNewSessionPrefersUnboundAccount 任务分散：两个条件完全相同的账号，其中一个
+// 已被任务 1 绑定，新任务 2 进来时应优先选「没人绑定」的那个号，避免并发任务的
+// 压力全部挤在同一个号的通道上（这正是「不同任务走不同的号」的调度语义）。
+func TestNewSessionPrefersUnboundAccount(t *testing.T) {
+	h, store := newTestHub(t, nil)
+	a := store.AddAccount("账号A", "sk-a", "free", "",
+		manifest([]string{"agnes-2.5-flash"}, []string{}, []string{}))
+	b := store.AddAccount("账号B", "sk-b", "free", "",
+		manifest([]string{"agnes-2.5-flash"}, []string{}, []string{}))
+	h.Reload()
+
+	store.Bind("ses:task-1", a.ID) // 任务 1 已绑定 A
+
+	res, err := h.Pick("ses:task-2", "text", "", "", nil) // 新任务 2 尚无绑定
+	if err != nil {
+		t.Fatalf("选号失败：%v", err)
+	}
+	if res.Account.ID != b.ID {
+		t.Fatalf("新任务应分散到未绑定的账号B，实际选中 %s（绑定数 A=%d B=%d）",
+			res.Account.Name,
+			store.BindingsCountByAccount()[a.ID], store.BindingsCountByAccount()[b.ID])
+	}
+	// 且选中后立即建立新绑定，后续请求保持粘性
+	if cnt := store.BindingsCountByAccount(); cnt[b.ID] != 1 {
+		t.Fatalf("新任务选中 B 后应建立绑定，实际 B 的绑定数 %d", cnt[b.ID])
+	}
+}
+
 // TestStickyBindingSpilloverOverloaded Account 是 B1 的核心修正。
 //
 // 旧实现命中绑定就直接返回该账号，既不比较负载也不看惩罚。而客户端默认不发会话头，

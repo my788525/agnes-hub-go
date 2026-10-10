@@ -1524,6 +1524,20 @@ func (s *Store) BindingsSnapshot() map[string]Binding {
 	return cloneMap(s.Bindings)
 }
 
+// BindingsCountByAccount 统计每个账号当前被多少个活跃任务（粘性会话）绑定。
+// 供调度器做「任务分散」：新任务优先选没人绑定的账号，避免并发任务的
+// 压力全部挤在同一个号的通道上。绑定有 SessionTTL 过期 GC，不会把已结束
+// 的旧任务永久算进占用。
+func (s *Store) BindingsCountByAccount() map[string]int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]int, len(s.Bindings))
+	for _, b := range s.Bindings {
+		out[b.AccountID]++
+	}
+	return out
+}
+
 // ClearBindings 清空全部绑定。
 func (s *Store) ClearBindings() {
 	s.mu.Lock()

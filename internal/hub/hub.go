@@ -848,11 +848,13 @@ func (h *Hub) pickWithPriority(poolClass string, exclude map[string]bool, requir
 	bestAcc := (*config.Account)(nil)
 	bestScore := pickScore{}
 	init := false
+	bindCnt := h.store.BindingsCountByAccount() // 账号 → 活跃任务（会话）绑定数
 	for _, a := range h.Candidates(poolClass, exclude, requiredModel) {
 		sc := pickScore{
 			priority:    a.Priority,
 			budgetTier:  h.budgetTier(a, s.RoutingMode),
 			regionMatch: config.IsCNHost(a.BaseURL) == primaryCN,
+			sessions:    bindCnt[a.ID],
 			wait:        h.Pacer(a, poolClass).ProjectedWait(),
 			inflight:    h.Inflight(a.ID),
 		}
@@ -868,6 +870,7 @@ type pickScore struct {
 	priority    int
 	budgetTier  int // 0 = 更优先（按 RoutingMode 决定速率型/用量型谁先被吃），1 = 兜底
 	regionMatch bool
+	sessions    int           // 该账号当前被多少个活跃任务（粘性会话）绑定；新任务优先分散到没人用的号
 	wait        time.Duration
 	inflight    int
 }
@@ -882,6 +885,11 @@ func (s pickScore) betterThan(o pickScore) bool {
 	}
 	if s.regionMatch != o.regionMatch {
 		return s.regionMatch // 同优先级内首选区域更优
+	}
+	// 任务分散：并发多个任务时各自粘到不同账号，避免所有压力挤在同一个号的通道上
+	// （同一任务仍靠软粘性保持稳定绑定，不受此影响）。
+	if s.sessions != o.sessions {
+		return s.sessions < o.sessions
 	}
 	if s.wait != o.wait {
 		return s.wait < o.wait
