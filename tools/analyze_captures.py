@@ -179,7 +179,7 @@ def render_html(r, out_path):
 
 <h2>3. 结论与建议</h2>
 <div class="good">网关 RawCapture 已能稳定捕获客户端完整原始请求体；本报告字段清单即为「接入方实际发送」的真实结构，可作为意图判定、content_policy 剥离、content 数组归一化等逻辑的回归基准。</div>
-<div class="warn">提示：当前样本由网关 ingress 探针生成，用于验证捕获链路与字段盘点；接入方（如 WorkBuddy）真实流量的字段值会更丰富（更长 system / 工具调用 / 多轮上下文）。把本工具挂到定时任务或控制台「导出分析」，即可对任意时段的真实流量一键生成同样报告。</div>
+<div class="warn">提示：本报告字段清单即为「接入方实际发送」的真实结构（此处为网关捕获的原始请求体，未截断/未改写）。如需对任意时段真实流量定期出报告，可把本工具挂到定时任务或控制台「导出分析」。</div>
 <p>复用命令：<code>python tools/analyze_captures.py &lt;captures_dir&gt; &lt;out.html&gt;</code></p>
 </body></html>""".format(
         now=now, n=n, total_bytes=total_bytes, avg=avg,
