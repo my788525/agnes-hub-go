@@ -106,6 +106,9 @@ type Hub struct {
 
 	// Metrics 是运行指标（/healthz 与控制台观测）。
 	Metrics Metrics
+
+	// hist 是动态图表的每秒历史序列（任务管理器风格实时图数据源）。
+	hist *History
 }
 
 // rate429Ring 记录最近 60s 内 429 时间戳，PerMinute() 返回窗口内命中次数。

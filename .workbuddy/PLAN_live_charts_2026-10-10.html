@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>控制台动态负载图表方案（任务管理器风格）· 2026-10-10</title>
+<style>
+  :root{
+    --bg:#f7f8fa; --card:#ffffff; --ink:#1f2933; --sub:#5b6573; --line:#e3e8ef;
+    --red:#d64545; --amber:#e08a1e; --green:#2f9e6f; --blue:#2f6fd6; --purple:#7a52c7;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,"Segoe UI",Roboto,"Helvetica Neue","PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--ink);line-height:1.65;font-size:15px}
+  .wrap{max-width:1080px;margin:0 auto;padding:28px 22px 60px}
+  h1{font-size:25px;margin:0 0 4px}
+  .sub{color:var(--sub);font-size:13px;margin-bottom:20px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px 22px;margin:16px 0;box-shadow:0 1px 3px rgba(20,30,50,.04)}
+  h2{font-size:19px;margin:2px 0 12px;display:flex;align-items:center;gap:8px}
+  h2 .n{display:inline-flex;width:26px;height:26px;border-radius:7px;background:var(--blue);color:#fff;align-items:center;justify-content:center;font-size:13px;font-weight:700}
+  h3{font-size:15px;margin:16px 0 6px;color:var(--ink)}
+  p{margin:8px 0}
+  .muted{color:var(--sub);font-size:13px}
+  table{width:100%;border-collapse:collapse;margin:10px 0;font-size:13.5px}
+  th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
+  th{background:#eef2f8;font-weight:600}
+  .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600;color:#fff}
+  .p-low{background:var(--green)} .p-med{background:var(--amber)} .p-hi{background:var(--red)} .p-ok{background:var(--blue)}
+  .tag{display:inline-block;padding:1px 7px;border-radius:6px;font-size:11.5px;background:#eef2f8;color:var(--sub);margin-right:4px}
+  .warn{background:#fff5f3;border:1px solid #f3c9c0;border-left:4px solid var(--red);border-radius:10px;padding:12px 16px;margin:12px 0}
+  .good{background:#f1f9f4;border:1px solid #bfe6cf;border-left:4px solid var(--green);border-radius:10px;padding:12px 16px;margin:12px 0}
+  ul{margin:8px 0 8px 2px;padding-left:20px} li{margin:5px 0}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:760px){.grid2{grid-template-columns:1fr}}
+  .kpis{display:flex;flex-wrap:wrap;gap:10px;margin:6px 0 2px}
+  .kpi{background:#eef2f8;border-radius:10px;padding:10px 14px;min-width:150px}
+  .kpi b{font-size:20px;display:block;color:var(--blue)} .kpi span{font-size:12px;color:var(--sub)}
+  code{background:#eef2f8;padding:1px 5px;border-radius:5px;font-size:12.5px}
+  .foot{color:var(--sub);font-size:12px;margin-top:24px;border-top:1px solid var(--line);padding-top:12px}
+  a{color:var(--blue)}
+  .demo{border:1px solid var(--line);border-radius:10px;overflow:hidden;margin:10px 0}
+  .demo .bar-area{height:64px;position:relative;background:linear-gradient(180deg,#fbfcfe,#f2f5fa)}
+  .demo svg{display:block;width:100%;height:100%}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>控制台动态负载图表方案 · 任务管理器风格</h1>
+  <div class="sub">2026-10-10 · agnes-hub-go (baiPiao-hub) · 目标：总览页增加持续滚动的实时图表——负载百分比、处理规模、多账号分配</div>
+
+  <div class="card">
+    <h2><span class="n">0</span>现状盘点（已核实代码）</h2>
+    <table>
+      <tr><th>已有</th><th>位置</th><th>局限</th></tr>
+      <tr><td>到达密度 60 秒环形缓冲（per_second[60] 秒桶）</td><td><code>internal/hub/hub.go</code> arrivalRing</td><td>只有到达数，没有负载率/吞吐/排队的时间序列</td></tr>
+      <tr><td>总览「到达密度 vs 节拍」迷你直方图</td><td><code>console.html</code> arrivalCard()，60 个 div 条</td><td>每次手动「刷新」才重画，<b>不滚动、无动画</b>；用的是 div 不是 canvas</td></tr>
+      <tr><td>每账号 buckets（rpm / waiting / projected_wait / factor / inflight）</td><td>Hub.Snapshot()</td><td>是瞬时快照，没有历史趋势</td></tr>
+      <tr><td>负载画像 loadWindow（120s 模态分布）</td><td>loadWindow（#24）</td><td>只有两个 60s 桶，粒度太粗画不了曲线</td></tr>
+      <tr><td>console.html 单文件零依赖 + go:embed</td><td>internal/web/static/</td><td>没有引入任何图表库（这是约束也是优点）</td></tr>
+    </table>
+    <div class="warn"><b>结论：</b>前端「动起来」只差两件事——① 后端要一个<b>持续采样的历史序列</b>（现在只有 60s 到达缓冲，且负载率/排队/账号分配都没进序列）；② 前端要一个<b>自绘 canvas 滚动图引擎</b> + 自动轮询（当前 refresh() 无定时器）。</div>
+  </div>
+
+  <!-- 1 -->
+  <div class="card">
+    <h2><span class="n">1</span>总体设计：一张图看懂</h2>
+    <div class="demo">
+      <svg viewBox="0 0 900 130" xmlns="http://www.w3.org/2000/svg">
+        <rect x="0" y="0" width="900" height="130" fill="#fbfcfe"/>
+        <g stroke="#e6ebf3" stroke-width="1">
+          <line x1="0" y1="30" x2="900" y2="30"/><line x1="0" y1="65" x2="900" y2="65"/><line x1="0" y1="100" x2="900" y2="100"/>
+        </g>
+        <!-- 负载率面积 -->
+        <path d="M0,110 L40,104 L80,98 L120,88 L160,90 L200,78 L240,82 L280,70 L320,60 L360,66 L400,52 L440,58 L480,44 L520,50 L560,38 L600,46 L640,34 L680,42 L720,30 L760,38 L800,26 L840,34 L900,28 L900,130 L0,130 Z" fill="rgba(47,111,214,.18)"/>
+        <path d="M0,110 L40,104 L80,98 L120,88 L160,90 L200,78 L240,82 L280,70 L320,60 L360,66 L400,52 L440,58 L480,44 L520,50 L560,38 L600,46 L640,34 L680,42 L720,30 L760,38 L800,26 L840,34 L900,28" fill="none" stroke="#2f6fd6" stroke-width="2"/>
+        <!-- 100% 红线 -->
+        <line x1="0" y1="18" x2="900" y2="18" stroke="#d64545" stroke-width="1" stroke-dasharray="5,4"/>
+        <text x="6" y="14" font-size="10" fill="#d64545">100%（池容量打满）</text>
+        <text x="880" y="24" font-size="11" fill="#2f6fd6" text-anchor="end">当前 62% ▸</text>
+        <text x="6" y="124" font-size="10" fill="#5b6573">-60s</text>
+        <text x="450" y="124" font-size="10" fill="#5b6573">-30s</text>
+        <text x="894" y="124" font-size="10" fill="#5b6573" text-anchor="end">now</text>
+      </svg>
+    </div>
+    <p class="muted">示意图：负载率滚动曲线（每秒右移一格，绿色 &lt;70%、黄色 70–100%、红线 = 池容量打满）。实际页面共三块图，见第 3 节。</p>
+    <ul>
+      <li><b>后端</b>：新增采样器 goroutine，每 1s 把「负载率 / 吞吐 / 排队 / 每账号完成数」拍一个快照进双环形缓冲（细窗口 10 分钟 @1s + 粗窗口 1 小时 @10s），暴露 <code>GET /api/metrics-history</code>。</li>
+      <li><b>前端</b>：console.html 新增「监控」tab，内嵌一个 ~120 行的自绘 canvas 图表引擎（无第三方库，保持 go:embed 零依赖约定），1s 轮询 history 端点，滚动重绘。资源管理器就是这个原理：CPU 采样 + 1s 重画。</li>
+      <li><b>既有卡片不动</b>：总览的到达密度直方图、KPI 卡保留，动态图表是新 tab + 总览底部一个 60s 缩略版入口。</li>
+    </ul>
+  </div>
+
+  <!-- 2 -->
+  <div class="card">
+    <h2><span class="n">2</span>后端：metricsHistory 采样器（新文件 <code>internal/hub/history.go</code>）</h2>
+    <h3>2.1 每秒快照字段（一个 point）</h3>
+    <table>
+      <tr><th>字段</th><th>口径</th><th>来源（复用现有）</th></tr>
+      <tr><td><code>ts</code></td><td>秒级时间戳</td><td>time.Now()</td></tr>
+      <tr><td><code>load_pct</code></td><td><b>负载百分比 = 到达速率 ÷ 池容量</b>；容量 = Σ(启用账号 text RPM) / 60（req/s）</td><td>arrivalRing.Counts() + pacer RPM（与现有 ratio 同口径，×100）</td></tr>
+      <tr><td><code>arrive_rps</code></td><td>到达 req/s（当前秒）</td><td>arrivalRing per_second 末位</td></tr>
+      <tr><td><code>done_rps</code></td><td>完成 req/s（成功完成差分）</td><td>Metrics.RequestsOK 计数器差分</td></tr>
+      <tr><td><code>queue_depth</code></td><td>排队深度 = Σ 各池 waiting</td><td>pacer.Waiting()</td></tr>
+      <tr><td><code>inflight</code></td><td>在途请求总数</td><td>Σ Inflight(account)</td></tr>
+      <tr><td><code>r429_per_min</code></td><td>最近 60s 上游 429</td><td>Recent429.PerMinute()</td></tr>
+      <tr><td><code>acc[]</code></td><td>每启用账号：<code>{id, inflight, done_delta}</code>（done_delta = 该账号本秒完成数差分，供分配占比）</td><td>账号 Stats 计数器差分</td></tr>
+    </table>
+    <h3>2.2 存储：双环形缓冲（内存上界 &lt; 100KB）</h3>
+    <table>
+      <tr><th>窗口</th><th>采样间隔</th><th>点数</th><th>覆盖</th><th>用途</th></tr>
+      <tr><td>fine</td><td>1s</td><td>600</td><td>10 分钟</td><td>默认视图（60s/300s 可切）</td></tr>
+      <tr><td>coarse</td><td>10s（fine 满时自动降采样挪入）</td><td>360</td><td>1 小时</td><td>「时」视图</td></tr>
+    </table>
+    <ul>
+      <li>单 goroutine（采样器）写 + 读加锁；采样器挂在现有维护循环旁边，进程空闲时照常采（画出来的平线本身就是信息）。</li>
+      <li>账号增删：新账号从 0 起记录；删掉的账号历史点保留，前端标注「已移除」并折叠成灰色。分配占比按 <code>done_delta / Σdone_delta</code> 归一化，天然不受账号数变化影响。</li>
+    </ul>
+    <h3>2.3 端点</h3>
+    <p><code>GET /api/metrics-history?win=fine|coarse</code> —— 鉴权同现有 console API；返回 <code>{points:[...], accounts:[{id,name,color}]}</code>。fine 全量 ~600 点 × 每点约 100 字节 JSON ≈ 60KB，轮询每次只回最近 N 点（按视图窗口裁剪），实际 1s 拉取约 <b>2–6KB</b>，NAS 本地无压力。</p>
+    <div class="good"><b>为什么轮询而不是 SSE/WebSocket：</b>与现有 <code>api()</code> 封装、鉴权、断线重连逻辑完全一致，零新基础设施；控制台是单管理员场景，1s 轮询的代价可忽略。SSE 留作后续优化项，不阻塞本期。</div>
+  </div>
+
+  <!-- 3 -->
+  <div class="card">
+    <h2><span class="n">3</span>前端：监控 tab + 自绘 canvas 引擎（console.html）</h2>
+    <h3>3.1 图表引擎（~120 行）</h3>
+    <ul>
+      <li>一个 <code>RollingChart</code> 类：输入点数组 + 系列定义（颜色/线型/面积），canvas 按设备像素比渲染；网格背景、右侧当前值标签、Y 轴自适应刻度——任务管理器同款视觉。</li>
+      <li>滚动手感：<b>每秒整体左移一格</b>（数据 shift），不做平滑插值动画——与资源管理器行为一致，实现最简、最省电。</li>
+      <li>窗口切换：60s / 5min / 1h 三个 pill 按钮，切 fine/coarse 数据源。</li>
+    </ul>
+    <h3>3.2 三块图</h3>
+    <table>
+      <tr><th>图</th><th>系列</th><th>读法</th></tr>
+      <tr><td><b>① 负载率 %</b>（核心）</td><td>load_pct 面积线；100% 红虚线</td><td>长期 &lt;70% = 账号有余量；顶到 100% = 该加账号/调 RPM 了；抖到 100% 以上回落 = 排队在兜底</td></tr>
+      <tr><td><b>② 处理规模</b></td><td>arrive_rps（蓝线）+ done_rps（绿线）+ queue_depth（黄色面积，右轴）+ inflight（紫线）</td><td>蓝绿线贴合 = 没积压；黄面积鼓包 = 排队在削峰；inflight 是同时在跑的请求数</td></tr>
+      <tr><td><b>③ 多账号分配</b>（堆叠面积）</td><td>每账号一个颜色的 done share %，图例 pill 实时显示百分比</td><td>一眼看出"活都让谁干了"；某账号颜色消失 = 被限流/熔断/冷却</td></tr>
+    </table>
+    <h3>3.3 事件刻度（细节加分项）</h3>
+    <ul>
+      <li>429 / 熔断打开 / 熔断复活发生的那一秒，在 ①② 图底部画一个红色/橙色小刻度线——资源管理器没有、但对这个项目特别有用（把「限流排队生效」从数字变成看得见的时间点）。</li>
+      <li>实现：history point 加一个 <code>events</code> 位掩码（1=429, 2=breaker open, 4=revive），零额外结构。</li>
+    </ul>
+    <h3>3.4 交互与放置</h3>
+    <ul>
+      <li>新「监控」tab 注册进 TABS 数组；总览到达卡片下方加一行「实时监控 →」链接跳转。</li>
+      <li>轮询只在监控 tab 激活 + 页面可见时跑（<code>visibilitychange</code> 暂停），切走即停——后台 NAS 上不留常驻流量。</li>
+      <li>canvas 常驻 DOM，轮询只 <code>redraw()</code> 不重建 innerHTML——避开现在整页 innerHTML 重渲染会闪的问题。</li>
+    </ul>
+  </div>
+
+  <!-- 4 -->
+  <div class="card">
+    <h2><span class="n">4</span>落地分期与改动清单</h2>
+    <table>
+      <tr><th>阶段</th><th>内容</th><th>改动文件</th><th>规模</th></tr>
+      <tr><td><span class="pill p-ok">阶段 1</span> 后端序列</td><td>history.go（采样器 + 双环 + 端点）+ 单测（差分正确性、降采样、账号增删对齐）</td><td><code>internal/hub/history.go</code>、<code>internal/hub/history_test.go</code>、<code>internal/hub/hub.go</code>（挂载）、<code>internal/web/console.go</code>（路由）</td><td>~200 行 Go</td></tr>
+      <tr><td><span class="pill p-ok">阶段 2</span> 前端图表</td><td>RollingChart 引擎 + 监控 tab + 三块图 + 轮询/可见性暂停</td><td><code>internal/web/static/console.html</code></td><td>~280 行 JS</td></tr>
+      <tr><td><span class="pill p-med">阶段 3</span> 打磨</td><td>事件刻度、账号图例折叠、总览 60s 缩略版、e2e</td><td>同上</td><td>~120 行</td></tr>
+    </table>
+    <ul>
+      <li>阶段 1 独立可发布（接口先行，前端后补也不破坏现有功能）。</li>
+      <li>发布随下一版 fpk 走既有流水线（版本号 +1，build_fpk.py 照常），NAS 热更三步不变。</li>
+    </ul>
+  </div>
+
+  <!-- 5 -->
+  <div class="card">
+    <h2><span class="n">5</span>风险与对策</h2>
+    <table>
+      <tr><th>风险</th><th>对策</th></tr>
+      <tr><td>多人开监控页 → NAS 轮询放大</td><td>history 读是 O(1) 快照拷贝；前端同一会话单轮询 + 页面不可见即停</td></tr>
+      <tr><td>每秒差分跨计数器回绕/重启</td><td>差分保护：delta&lt;0 视为计数器重置，记 0 并重置基线（单测覆盖）</td></tr>
+      <tr><td>账号频繁增删导致堆叠图错位</td><td>按 account id 对齐 + 归一化 share；已删账号灰色折叠</td></tr>
+      <tr><td>canvas 高分屏模糊</td><td>devicePixelRatio 缩放 + resize 监听（模板里已有同类处理习惯）</td></tr>
+      <tr><td>console.html 单文件继续膨胀</td><td>图表引擎独立成 <code>static/chart.js</code>（go:embed 已支持多静态文件，引入成本为零）</td></tr>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2><span class="n">6</span>待你拍板的三个口径</h2>
+    <ul>
+      <li><b>负载率分母</b>：v1 只按 text 池（与现有比值同口径，最稳）；image/video 池要不要 v2 加模态切换 tab？</li>
+      <li><b>默认窗口</b>：60s（资源管理器默认感）还是 5min（更实用）？建议默认 60s、一键切 5min/1h。</li>
+      <li><b>放置</b>：独立「监控」tab（推荐，信息密度高不挤总览）还是嵌进总览 arrival 卡下面？</li>
+    </ul>
+  </div>
+
+  <div class="foot">agnes-hub-go · 控制台动态负载图表方案 · 2026-10-10 · 确认后按阶段 1 → 2 → 3 落地并随下版 fpk 发布</div>
+</div>
+</body>
+</html>

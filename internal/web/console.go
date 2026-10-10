@@ -72,6 +72,7 @@ func (s *Server) consoleRoutes() {
 
 	m.HandleFunc("GET /api/stats", s.apiStats)
 	m.HandleFunc("GET /api/queue", s.apiQueue)
+	m.HandleFunc("GET /api/metrics-history", s.apiMetricsHistory)
 	m.HandleFunc("GET /api/logs", s.apiLogs)
 	m.HandleFunc("GET /api/bindings", s.apiBindings)
 	m.HandleFunc("POST /api/bindings/clear", s.apiClearBindings)
@@ -877,6 +878,19 @@ func (s *Server) apiQueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"queue": s.Hub.QueueView()}, nil)
+}
+
+// apiMetricsHistory 返回实时图表用的历史序列（任务管理器风格动态图数据源）。
+func (s *Server) apiMetricsHistory(w http.ResponseWriter, r *http.Request) {
+	if !s.authed(r) {
+		s.deny(w)
+		return
+	}
+	win := r.URL.Query().Get("win")
+	if win != "coarse" {
+		win = "fine"
+	}
+	writeJSON(w, 200, s.Hub.MetricsHistory(win), nil)
 }
 
 func (s *Server) apiLogs(w http.ResponseWriter, r *http.Request) {

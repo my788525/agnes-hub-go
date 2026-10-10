@@ -29,7 +29,7 @@ import (
 	"agneshub/internal/web"
 )
 
-var version = "1.0.28"
+var version = "1.0.29"
 
 func env(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -78,6 +78,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	h.StartMaintenance(ctx)
+	h.StartHistory(ctx)
 
 	srv := web.New(store, h, relay.BuildClientForAccounts(len(store.AccountsSnapshot())))
 	srv.Version = version

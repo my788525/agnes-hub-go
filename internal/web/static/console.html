@@ -106,6 +106,27 @@
   border-radius:10px;padding:10px 12px;margin-top:10px}
 .reqbox .trunc{color:var(--warn,#d29922);font-size:12px;margin-top:6px}
 .reqbox .muted{color:var(--muted,#8b949e)}
+
+/* ---------------- 实时动态图表（运行实况） ---------------- */
+.live-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+.live-head .win-pill{padding:3px 11px;border-radius:999px;border:1px solid var(--line,#e3e8ef);
+  background:#fff;color:var(--sub,#5b6573);font-size:12px;font-weight:600;cursor:pointer}
+.live-head .win-pill.on{background:var(--blue,#2f6fd6);color:#fff;border-color:var(--blue,#2f6fd6)}
+.live-head .live-dot{width:9px;height:9px;border-radius:50%;background:var(--green,#2f9e6f);
+  box-shadow:0 0 0 0 rgba(47,158,111,.6);animation:pulse 1.4s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(47,158,111,.5)}70%{box-shadow:0 0 0 7px rgba(47,158,111,0)}100%{box-shadow:0 0 0 0 rgba(47,158,111,0)}}
+.live-card{background:var(--card,#fff);border:1px solid var(--line,#e3e8ef);border-radius:14px;
+  padding:16px 18px;margin:14px 0}
+.live-card h3{margin:0 0 2px;font-size:15px}
+.live-card .sub2{color:var(--sub,#5b6573);font-size:12px;margin-bottom:8px}
+.live-canvas{width:100%;height:150px;display:block}
+.live-readout{display:flex;flex-wrap:wrap;gap:12px;margin-top:8px}
+.live-readout b{font-size:18px;font-weight:600}
+.live-readout span{font-size:11px;color:var(--sub,#5b6573);display:block}
+.live-legend{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.live-legend .lg{display:inline-flex;align-items:center;gap:5px;font-size:12px;
+  background:#eef2f8;border-radius:999px;padding:2px 9px}
+.live-legend .lg i{width:9px;height:9px;border-radius:2px;display:inline-block}
 </style>
 </head>
 <body>
@@ -289,6 +310,7 @@ function viewOverview(){
   }).join("");
   return `
   ${banner}
+  ${liveSection()}
   <div class="grid g4" style="margin-bottom:14px">
     <div class="kpi"><div class="k">请求总数</div><div class="v">${num(m.requests_total)}</div></div>
     <div class="kpi"><div class="k">成功</div><div class="v">${num(m.requests_ok)}</div></div>
@@ -982,6 +1004,255 @@ function bindSettingsEvents(){
   };
 }
 
+/* ---------------- 实时动态图表（运行实况 · 总览第二屏） ---------------- */
+const LIVE = { timer:null, win:"60s", hist:null, meta:[] };
+function liveWantPoints(){ return LIVE.win==="30s"?30:(LIVE.win==="5m"?300:(LIVE.win==="1h"?360:60)); }
+function liveUseCoarse(){ return LIVE.win==="1h"; }
+
+function liveSection(){
+  const w = LIVE.win==="30s"?"最近 30 秒":(LIVE.win==="5m"?"最近 5 分钟":(LIVE.win==="1h"?"最近 1 小时":"最近 60 秒"));
+  return `
+  <div class="card" style="margin-top:16px">
+    <div class="live-head">
+      <h2 style="margin:0">运行实况 · 实时</h2>
+      <span class="live-dot" title="每秒自动采样，图表自动滚动，无需手动刷新"></span>
+      <span class="muted" style="font-size:12px">每秒采样 · 不刷新页面 · 自动滚动（${w}）</span>
+      <div style="flex:1"></div>
+      ${["30s","60s","5m","1h"].map(x=>`<button class="win-pill ${LIVE.win===x?"on":""}" data-win="${x}">${x}</button>`).join("")}
+    </div>
+    <div class="live-card">
+      <h3>① 多账号分配 <span class="muted" style="font-weight:400;font-size:12px">（各账号完成的请求占比）</span></h3>
+      <div class="sub2">一眼看出「活都让谁干了」，色块上直接标账号名；某颜色消失 = 该账号被限流 / 冷却 / 熔断中。</div>
+      <canvas class="live-canvas" id="cvAcc"></canvas>
+      <div class="live-legend" id="lgAcc"></div>
+    </div>
+    <div class="live-card">
+      <h3>② 负载率 % <span class="muted" style="font-weight:400;font-size:12px">（到达速率 ÷ text 池容量）</span></h3>
+      <div class="sub2">绿 &lt;70% 有余量 · 黄 70~100% 接近打满 · 红 ≥100% 排队在兜底。红虚线 = 池容量 100%。</div>
+      <canvas class="live-canvas" id="cvLoad"></canvas>
+      <div class="live-readout" id="roLoad"></div>
+    </div>
+    <div class="live-card">
+      <h3>③ 处理规模 <span class="muted" style="font-weight:400;font-size:12px">（到达 / 完成 / 在途 / 排队）</span></h3>
+      <div class="sub2">蓝=到达 req/s，绿=完成 req/s，紫虚线=在途，黄面积=排队深度（右轴）。到达贴着完成 = 没积压。</div>
+      <canvas class="live-canvas" id="cvScale"></canvas>
+      <div class="live-readout" id="roScale"></div>
+    </div>
+    <div class="muted" style="font-size:11px;margin-top:6px">图表底部竖线：<span style="color:#d64545">红 = 上游 429</span> · <span style="color:#e08a1e">橙 = 熔断打开</span>。</div>
+  </div>`;
+}
+
+function setupCanvas(cv){
+  const dpr = window.devicePixelRatio||1;
+  const w = cv.clientWidth||600, h = cv.clientHeight||150;
+  const cw = Math.round(w*dpr), ch = Math.round(h*dpr);
+  if(cv.width!==cw||cv.height!==ch){ cv.width=cw; cv.height=ch; }
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,w,h);
+  return {ctx,w,h};
+}
+function inkColor(){ return getComputedStyle(document.body).color || "#5b6573"; }
+function emptyHint(cv, text){
+  const {ctx,w,h}=setupCanvas(cv);
+  ctx.globalAlpha=.55; ctx.fillStyle=inkColor(); ctx.font="12px sans-serif"; ctx.textAlign="center";
+  ctx.fillText(text, w/2, h/2); ctx.globalAlpha=1;
+}
+
+// drawLines：通用滚动折线/面积图（支持右轴与参考线、事件刻度）
+function drawLines(cv, series, opts){
+  const {ctx,w,h}=setupCanvas(cv);
+  const padL=36, padR=opts.rightMax?34:12, padT=8, padB=18;
+  const plotW=w-padL-padR, plotH=h-padT-padB;
+  const ink=inkColor();
+  ctx.strokeStyle="rgba(140,140,140,.22)"; ctx.lineWidth=1; ctx.font="10px sans-serif";
+  for(let g=0;g<=4;g++){
+    const y=padT+plotH*g/4;
+    ctx.beginPath(); ctx.moveTo(padL,y); ctx.lineTo(w-padR,y); ctx.stroke();
+    ctx.globalAlpha=.7; ctx.fillStyle=ink;
+    ctx.textAlign="right"; ctx.textBaseline="middle";
+    ctx.fillText(String(Math.round(opts.leftMax*(1-g/4))), padL-5, y);
+    if(opts.rightMax){ ctx.textAlign="left"; ctx.fillText(String(Math.round(opts.rightMax*(1-g/4))), w-padR+5, y); }
+    ctx.globalAlpha=1;
+  }
+  const n = Math.max(1, Math.max.apply(null, series.map(s=>s.data.length||0)));
+  if(n<2){ emptyHint(cv,"采样中…每秒一个点，稍等即出"); return; }
+  const xAt=i=>padL+(i/(n-1))*plotW;
+  series.forEach(s=>{
+    const max=(s.axis==="r"?opts.rightMax:opts.leftMax)||1;
+    const yAt=v=>padT+plotH-Math.max(0,Math.min((v||0)/max,1))*plotH;
+    if(s.fill){
+      ctx.beginPath(); ctx.moveTo(xAt(0),padT+plotH);
+      s.data.forEach((v,i)=>ctx.lineTo(xAt(i),yAt(v)));
+      ctx.lineTo(xAt(s.data.length-1),padT+plotH); ctx.closePath();
+      ctx.fillStyle=s.color; ctx.globalAlpha=.17; ctx.fill(); ctx.globalAlpha=1;
+    }
+    ctx.beginPath();
+    s.data.forEach((v,i)=>{ const x=xAt(i),y=yAt(v); if(i===0)ctx.moveTo(x,y); else ctx.lineTo(x,y); });
+    ctx.strokeStyle=s.color; ctx.lineWidth=s.width||2;
+    if(s.dash) ctx.setLineDash(s.dash);
+    ctx.stroke(); ctx.setLineDash([]);
+  });
+  (opts.refY||[]).forEach(r=>{
+    const max=(r.axis==="r"?opts.rightMax:opts.leftMax)||1;
+    const y=padT+plotH-Math.min(r.v/max,1)*plotH;
+    ctx.beginPath(); ctx.moveTo(padL,y); ctx.lineTo(w-padR,y);
+    ctx.strokeStyle=r.color; ctx.setLineDash([4,4]); ctx.lineWidth=1; ctx.stroke(); ctx.setLineDash([]);
+  });
+  (opts.events||[]).forEach((e,i)=>{
+    if(!e) return;
+    const x=padL+(i/(n-1))*plotW;
+    ctx.fillStyle=(e&1)?"#d64545":"#e08a1e";
+    ctx.fillRect(x-1, h-padB+3, 2, 6);
+  });
+}
+
+// drawStack：多账号分配堆叠面积（每秒归一化到 100%）
+function drawStack(cv, meta, cols, events){
+  const {ctx,w,h}=setupCanvas(cv);
+  const padL=6,padR=6,padT=8,padB=18;
+  const plotW=w-padL-padR, plotH=h-padT-padB;
+  const n=cols.length||0;
+  ctx.strokeStyle="rgba(140,140,140,.22)"; ctx.lineWidth=1;
+  for(let g=1;g<4;g++){
+    const y=padT+plotH*g/4;
+    ctx.beginPath(); ctx.moveTo(padL,y); ctx.lineTo(w-padR,y); ctx.stroke();
+  }
+  if(n<2||!meta.length){ emptyHint(cv,"采样中…"); return; }
+  const totalAll=cols.reduce((a,c)=>a+c.reduce((x,y)=>x+y,0),0);
+  if(totalAll<=0){
+    ctx.globalAlpha=.55; ctx.fillStyle=inkColor(); ctx.font="12px sans-serif"; ctx.textAlign="center";
+    ctx.fillText("窗口内没有完成任何请求（空闲中）", w/2, h/2-6); ctx.globalAlpha=1;
+  }
+  const xAt=i=>padL+(n>1?(i/(n-1))*plotW:0);
+  let prev=new Array(n).fill(0);
+  for(let k=0;k<meta.length;k++){
+    const cur=new Array(n);
+    for(let i=0;i<n;i++){
+      const tot=cols[i].reduce((a,b)=>a+b,0)||0;
+      cur[i]=prev[i]+(tot>0?(cols[i][k]||0)/tot:0);
+    }
+    ctx.beginPath();
+    for(let i=0;i<n;i++){ const x=xAt(i),y=padT+plotH-cur[i]*plotH; if(i===0)ctx.moveTo(x,y); else ctx.lineTo(x,y); }
+    for(let i=n-1;i>=0;i--){ const x=xAt(i),y=padT+plotH-prev[i]*plotH; ctx.lineTo(x,y); }
+    ctx.closePath();
+    ctx.fillStyle=meta[k].color||"#2f6fd6"; ctx.globalAlpha=.82; ctx.fill(); ctx.globalAlpha=1;
+
+    // 在色块上直接标注账号名：从中间往外找第一个「够厚」的位置，避免每秒左右跳动；
+    // 太窄的带（小于 13px）不画，防止小账号文字叠成一团。
+    const mid=Math.floor(n/2);
+    let li=-1;
+    for(let d=0; d<=mid && li<0; d++){
+      for(const i of (d===0?[mid]:[mid-d,mid+d])){
+        if(i>=0&&i<n&&(cur[i]-prev[i])*plotH>=13){ li=i; break; }
+      }
+    }
+    if(li>=0){
+      const thick=(cur[li]-prev[li])*plotH;
+      const cx=Math.max(padL+26, Math.min(w-padR-26, xAt(li)));
+      const cy=padT+plotH-(prev[li]+(cur[li]-prev[li])/2)*plotH;
+      let label=meta[k].name||meta[k].id||"";
+      if(label.length>12) label=label.slice(0,11)+"…";
+      ctx.font="600 11px sans-serif";
+      ctx.textAlign="center"; ctx.textBaseline="middle";
+      ctx.lineWidth=3; ctx.lineJoin="round";
+      ctx.strokeStyle="rgba(0,0,0,.45)"; ctx.strokeText(label,cx,cy); // 描边保证浅色带也看得清
+      ctx.fillStyle="#fff"; ctx.fillText(label,cx,cy);
+      if(thick>=30){ // 带宽足够时顺带标百分比
+        const pct=Math.round((cur[li]-prev[li])*100)+"%";
+        ctx.font="10px sans-serif";
+        ctx.strokeText(pct,cx,cy+12); ctx.fillText(pct,cx,cy+12);
+      }
+    }
+    prev=cur;
+  }
+  (events||[]).forEach((e,i)=>{
+    if(!e) return;
+    const x=xAt(i);
+    ctx.fillStyle=(e&1)?"#d64545":"#e08a1e";
+    ctx.fillRect(x-1, h-padB+3, 2, 6);
+  });
+}
+
+function drawLive(){
+  if(!LIVE.hist) return;
+  const cvL=document.getElementById("cvLoad"), cvS=document.getElementById("cvScale"), cvA=document.getElementById("cvAcc");
+  if(!cvL||!cvS||!cvA) return;
+  const slice=(LIVE.hist.points||[]).slice(-liveWantPoints());
+  if(!slice.length){
+    emptyHint(cvL,"采样中…"); emptyHint(cvS,"采样中…"); emptyHint(cvA,"采样中…"); return;
+  }
+  const events=slice.map(p=>p.events||0);
+
+  // ① 负载率
+  const load=slice.map(p=>p.load_pct||0);
+  const cur=load[load.length-1]||0;
+  const peak=Math.max.apply(null,load);
+  const avg=load.reduce((a,b)=>a+b,0)/load.length;
+  const c1=cur>=100?"#d64545":(cur>=70?"#e08a1e":"#2f9e6f");
+  drawLines(cvL,[{data:load,color:c1,fill:true}],{leftMax:Math.max(120,peak)*1.1,refY:[{v:100,color:"#d64545"}],events});
+  document.getElementById("roLoad").innerHTML=
+    `<div><b style="color:${c1}">${cur.toFixed(0)}%</b><span>当前负载率</span></div>
+     <div><b>${peak.toFixed(0)}%</b><span>窗口峰值</span></div>
+     <div><b>${avg.toFixed(0)}%</b><span>窗口均值</span></div>`;
+
+  // ② 处理规模
+  const arrive=slice.map(p=>p.arrive_rps||0), done=slice.map(p=>p.done_rps||0);
+  const inf=slice.map(p=>p.inflight||0), q=slice.map(p=>p.queue_depth||0);
+  const lmax=Math.max(5,Math.max.apply(null,arrive.concat(done,inf)))*1.25;
+  const rmax=Math.max(2,Math.max.apply(null,q))*1.3;
+  drawLines(cvS,[
+    {data:q,color:"#e08a1e",fill:true,axis:"r"},
+    {data:arrive,color:"#2f6fd6"},
+    {data:done,color:"#2f9e6f"},
+    {data:inf,color:"#7a52c7",width:1.5,dash:[4,3]}
+  ],{leftMax:lmax,rightMax:rmax,events});
+  const last=slice[slice.length-1]||{};
+  document.getElementById("roScale").innerHTML=
+    `<div><b style="color:#2f6fd6">${(last.arrive_rps||0).toFixed(1)}</b><span>到达 req/s</span></div>
+     <div><b style="color:#2f9e6f">${(last.done_rps||0).toFixed(1)}</b><span>完成 req/s</span></div>
+     <div><b style="color:#7a52c7">${last.inflight||0}</b><span>在途</span></div>
+     <div><b style="color:#e08a1e">${last.queue_depth||0}</b><span>排队</span></div>
+     <div><b>${last.r429_pm||0}</b><span>429/分钟</span></div>`;
+
+  // ③ 多账号分配
+  const meta=LIVE.meta||[];
+  const cols=slice.map(p=>{
+    const byId={}; (p.acc||[]).forEach(a=>{ byId[a.id]=a.done_delta||0; });
+    return meta.map(m=>byId[m.id]||0);
+  });
+  drawStack(cvA,meta,cols,events);
+  const lastCol=cols[cols.length-1]||[];
+  const lt=lastCol.reduce((a,b)=>a+b,0)||0;
+  document.getElementById("lgAcc").innerHTML = meta.map((m,i)=>{
+    const pct = lt>0 ? Math.round((lastCol[i]||0)/lt*100) : 0;
+    return `<span class="lg"><i style="background:${m.color}"></i>${esc(m.name||m.id)} ${pct}%</span>`;
+  }).join("") || `<span class="muted">还没有账号</span>`;
+}
+
+async function liveTick(){
+  if(state.tab!=="overview" || document.visibilityState!=="visible") return;
+  if(!document.getElementById("cvLoad")) return;
+  try{
+    LIVE.hist = await api("/api/metrics-history?win="+(liveUseCoarse()?"coarse":"fine"));
+    LIVE.meta = LIVE.hist.accounts||[];
+    drawLive();
+  }catch(e){ /* 静默：下一次 tick 自动重试 */ }
+}
+function startLiveTimer(){
+  if(LIVE.timer) return;
+  LIVE.timer = setInterval(liveTick, 1000);
+  document.addEventListener("visibilitychange", ()=>{ if(document.visibilityState==="visible") liveTick(); });
+  window.addEventListener("resize", ()=>{ if(state.tab==="overview") drawLive(); });
+}
+function bindLive(){
+  startLiveTimer();
+  document.querySelectorAll(".win-pill").forEach(b=>{
+    b.onclick=()=>{ LIVE.win=b.dataset.win; render(); liveTick(); };
+  });
+  liveTick();
+}
+
 /* ---------------- 数据拉取 ---------------- */
 async function refresh(){
   try{
@@ -1007,7 +1278,7 @@ async function refresh(){
 }
 function render(){
   const v = document.getElementById("view");
-  if(state.tab==="overview"){ v.innerHTML = viewOverview(); }
+  if(state.tab==="overview"){ v.innerHTML = viewOverview(); bindLive(); }
   else if(state.tab==="accounts"){ v.innerHTML = viewAccounts(); bindAccountEvents(); }
   else if(state.tab==="keys"){ v.innerHTML = viewKeys(); bindKeyEvents(); }
   else if(state.tab==="queue"){
