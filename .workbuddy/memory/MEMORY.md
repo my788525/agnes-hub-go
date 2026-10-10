@@ -34,11 +34,27 @@
 6. **无号可用** → 返回最后那次真实上游结果（含 429/402 语义），不甩无信息量的「无可用账号」。
 7. **缺 finish chunk 就断流** → 合成 `finish_reason=stop` + `[DONE]`：client SDK 否则会判「响应未完成」抛错终止任务。
 - **边界铁律**：软失败检测只认 OpenAI/Gemini/Anthropic 三种文本对话结构，**认不出的一律视为可用**（视频轮询 `{status:"queued"}` 无 choices，误判空内容会无限重发，已有测试守住）；只在 Continuable 路径启用；Gemini content 是 `{parts:[{text}]}` 必须单独取。
-- 相关设置：`continuation_max_rounds`(2)、`soft_fail_retry_max`(2)、`stream_auto_resume`(true)。
+- 相关设置：`continuation_max_rounds`(2)、`soft_fail_retry_max`(2)、`stream_auto_resume`(true)；线上另有 `request_timeout_ms`(300000，非流式墙钟)、`stream_idle_timeout_ms`(90000，流式空闲看门狗)、`retry_max`(3)、`rate_limit_retry_max`(8)。注意 `internal/relay/relay.go` 的 upstream `http.Client` **不设** Client.Timeout（会掐长 SSE），超时由 per-request context 承载，别误加成 Client.Timeout。
+- **这套体系的边界：以下情况客户端仍会停，且网关救不了**（2026-10-10 盘点，答复「现在是不是基本不会异常停止」用）：
+  1. **请求没到网关**（今日实证的 CF 隧道黑洞 / 代理 / NAT 止血）。发生于网关之前，续写换号都够不着 → 只能客户端侧超时 + 内网直连。
+  2. **网关进程重启 / 热更**：优雅停机有 30s 排空宽限，但窗口外的在途请求会被切断。热更前知会用户。
+  3. **非文本模态**（生图 / 生视频 / 视频轮询）不在 Continuable 路径，不享受续写与软失败换号重发，仅保留 429/5xx 换号重试。
+  4. **tool_calls 截断**提取不到纯文本 → 明确不续写，原样返回。
+  5. **上游彻底失效 / 所有号额度耗尽 / 全熔断**：预算耗尽后如实把最后一次真实上游结果（402/429/5xx）交还客户端——这是刻意设计，不是缺陷。
+  6. **客户端自身超时**：客户端预算应 ≥ 网关预算（非流式 5min × 3 次重试的量级），否则网关还在重试、客户端已放弃。
 - 观测：`/healthz` 的 `continuations` / `soft_fail_retries` / `resumed_streams` / `pending` / `accepted`。
 
+## 客户端接入路径铁律（2026-10-10 实证，血泪）
+**内网一律 `http://192.168.100.3:4142/v1` 直连，绝不要绕任何中间层。** 用户此前把 WorkBuddy 渠道配成 **Cloudflare Tunnel 域名**（NAS 上装了 `com.dustinky.tunnel`，cloudflared `--protocol quic`），导致三大症状：
+- 客户端「思考中」卡 **18 分钟**，网关侧 usage/raw_capture **零痕迹**（请求死在到达网关之前）。
+- 「测试连接」时好时坏：1 秒成功 / 20 秒 / 1 分钟失败。
+- 换回局域网 IP 后 **10/10 全部成功**（决定性对照实验）。
+机理：CF 边缘对 idle 连接约 100s 就掐，客户端 keep-alive 池复用半死连接、往里写 275KB 大上下文 → 写进黑洞 → TCP 重传超时十几分钟；QUIC/UDP 走家宽 QoS 抖动 + 边缘重建慢 = 20s~1min 延迟。
+**这类中断网关的续写/换号韧性层救不了**（发生在网关之前），只能靠客户端侧超时 + 直连。用户已卸载 cloudflared（2026-10-10 19:0x，验证：无 cloudflared 进程、应用中心列表已无 tunnel）。
+同理提醒：动态域名/DDNS 在内网访问依赖路由器 **NAT 回环（hairpin）**，多数家用路由不支持 → 在家照样别用域名；外网要用需端口转发 4142，且必须确认控制台强密码 + downstream key 随机后再暴露。
+
 ## 排障套路：「客户端转圈但控制台看不出负载」
-1. 先看 `/healthz`：`pending>0` → 请求在网关内（HTTP 层已进入但没走完），去查 upstream；`accepted` 不涨 → 请求压根没到网关，查客户端/网络。
+1. 先看 `/healthz`：`pending>0` → 请求在网关内（HTTP 层已进入但没走完），去查 upstream；`accepted` 不涨 → 请求压根没到网关，查客户端/网络/**接入路径是否绕了隧道或代理**。
 2. `last_success_age_ms` 是「多久没有流量真正跑通」的第一指标，比 uptime 有用得多。
 3. `ss -tn | grep 4142` 看是否还有连接存活；`raw_capture/` 目录 mtime 是「最近一次收到请求」的旁证（RawCaptureEnabled 开启时）。
 4. 用 curl `-w "TTFB=%{time_starttransfer}s TOTAL=%{time_total}s"` 精确测网关吞吐，避免凭感觉判断慢在哪。
