@@ -2046,3 +2046,8 @@ func (s *Store) CaptureRawRequest(raw []byte) {
 	name := filepath.Join(dir, fmt.Sprintf("req_%d.json", time.Now().UnixNano()))
 	_ = os.WriteFile(name, raw, 0o644)
 }
+
+// RawCaptureDir 返回原始请求捕获目录（data/raw_capture）。供控制台「导出分析」端点读取。
+func (s *Store) RawCaptureDir() string {
+	return filepath.Join(s.Dir, "raw_capture")
+}

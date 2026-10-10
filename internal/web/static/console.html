@@ -897,6 +897,7 @@ function viewSettings(){
     <div class="row">
       <button id="btnExport">导出配置（不含密钥明文）</button>
       <button id="btnExportFull">导出含密钥</button>
+      <button id="btnExportCapture">导出 RawCapture 分析</button>
       <button id="btnImport" class="primary">导入配置</button>
     </div>
   </div>`;
@@ -943,6 +944,9 @@ function bindSettingsEvents(){
   };
   document.getElementById("btnExport").onclick = exp(true);
   document.getElementById("btnExportFull").onclick = exp(true);
+  document.getElementById("btnExportCapture").onclick = () => {
+    window.open("/api/export/capture-analysis", "_blank");
+  };
   const applySc = document.getElementById("btnApplyScenario");
   if(applySc) applySc.onclick = async ()=>{
     const name = document.getElementById("s_scenario").value;

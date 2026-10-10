@@ -90,6 +90,7 @@ func (s *Server) consoleRoutes() {
 	m.HandleFunc("POST /api/settings", s.apiSetSettings)
 	m.HandleFunc("GET /api/scenarios", s.apiListScenarios)
 	m.HandleFunc("GET /api/export", s.apiExport)
+	m.HandleFunc("GET /api/export/capture-analysis", s.apiExportCaptureAnalysis)
 	m.HandleFunc("POST /api/import", s.apiImport)
 
 	m.HandleFunc("POST /api/intent/preview", s.apiIntentPreview)
