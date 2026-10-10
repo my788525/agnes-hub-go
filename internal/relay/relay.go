@@ -42,9 +42,165 @@ var AuthFailStatus = map[int]bool{401: true, 403: true, 402: true}
 
 // contentPolicyRe 匹配客户端（WorkBuddy）注入的 <content_policy>...</content_policy> 段。
 // 只在开关 StripContentPolicy 开启时对上传体做整段剥离：这是纯字节替换（远轻于 gzip 的
-// ~1ms），目的是省 token 而非省速度。该块以 JSON 字符串值形式出现在 messages 里（<> 在
-// JSON 中无需转义、原样保留），整段删除后字符串值变短、仍是合法 JSON，不影响结构。
+// ~1ms），目的是省 token 而非省速度。
+//
+// 注意：绝不能用 contentPolicyRe.ReplaceAll 裸替换。当上下文里出现多个标签字面量
+// （如编码会话把本文件源码带进对话时），(?s).*? 会把一个 JSON 字符串里的开标签与
+// **另一个字符串里**的闭标签配对，吞掉中间的 " } , : 等结构字符，转发出去的请求体
+// 变成非法 JSON，上游报 400 "invalid character '{' looking for beginning of object
+// key string"（v1.0.26 线上实证）。必须走 stripContentPolicy 做 JSON 字符串感知剥离。
 var contentPolicyRe = regexp.MustCompile(`(?s)<content_policy>.*?</content_policy>`)
+
+// stripContentPolicy 返回剥离 <content_policy> 块后的请求体。JSON 安全：
+//  1. 只删除「完整落在单个 JSON 字符串字面量内部」的匹配段 —— 字符串中段删除
+//     永远不会破坏结构；跨字符串边界/位于结构位置的匹配一律原样保留
+//     （顶多多花点 token，绝不弄坏请求）。
+//  2. 兜底：删除后跑 json.Valid 校验，非法则整体放弃剥离、返回原体。
+//
+// 返回新切片，不修改 body 底层数组（bodyFor 可能对多个账号返回同一 rawBody，
+// 原地删除会污染后续重试）。
+func stripContentPolicy(body []byte) []byte {
+	matches := contentPolicyRe.FindAllSubmatchIndex(body, -1)
+	if matches == nil {
+		return body
+	}
+	spans := jsonStringSpans(body)
+	var dels [][2]int // 待删除区间（升序、互不重叠）
+	for _, m := range matches {
+		s, e := m[0], m[1]
+		for _, sp := range spans {
+			if s >= sp[0] && e <= sp[1] {
+				dels = append(dels, [2]int{s, e})
+				break
+			}
+		}
+	}
+	if len(dels) == 0 {
+		return body
+	}
+	out := make([]byte, 0, len(body))
+	prev := 0
+	for _, d := range dels {
+		out = append(out, body[prev:d[0]]...)
+		prev = d[1]
+	}
+	out = append(out, body[prev:]...)
+	if !json.Valid(out) {
+		return body // 兜底：任何意外情况都宁可多发 token，不发坏体
+	}
+	return out
+}
+
+// jsonStringSpans 扫描 body，返回所有 JSON 字符串字面量的内容区间 [内容起点, 结束引号处)。
+// 正确处理 \" 与 \\ 转义。body 不是合法 JSON 时返回的区间无意义，但配合上面的
+// json.Valid 兜底不会造成危害。
+func jsonStringSpans(body []byte) [][2]int {
+	var spans [][2]int
+	inStr, esc := false, false
+	start := 0
+	for i, c := range body {
+		if !inStr {
+			if c == '"' {
+				inStr, start = true, i+1
+			}
+			continue
+		}
+		switch {
+		case esc:
+			esc = false
+		case c == '\\':
+			esc = true
+		case c == '"':
+			spans = append(spans, [2]int{start, i})
+			inStr = false
+		}
+	}
+	return spans
+}
+
+// normalizeContentArray 把 OpenAI 风格请求里 messages[].content 为 array（多模态 blocks）
+// 的情况归一化为 string，以适配 agnes OpenAI 端「content 必须是 string」的 schema
+// （v1.0.26 线上实证：客户端发 content 为 array 时上游报 400 "Type mismatch of
+// '/messages/N/content', 'array' not in 'string'"）。
+//
+// 安全原则与 stripContentPolicy 一致，宁可不归一化也不弄坏/丢内容：
+//   - 仅当 content 是 array 且其中每个元素都能安全转成文本（text 块或纯字符串）才转；
+//   - 只要遇到 image_url / audio / 未知类型等无法安全文本化的块，整体保留原 array
+//     （顶多让上游报 schema 错，绝不丢弃或编造内容）；
+//   - 解析 / 序列化 / 校验任一步失败都返回原体。
+//
+// 用 map[string]any 保留所有顶层字段，只替换 messages[].content，避免窄结构
+// re-marshal 丢掉 model/tools/stream 等字段。仅 OpenAI 风格路径调用（非 Anthropic——
+// Anthropic 协议本就以 array blocks 表达 content，不能动）。
+func normalizeContentArray(body []byte) []byte {
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return body
+	}
+	msgs, ok := doc["messages"].([]any)
+	if !ok {
+		return body
+	}
+	changed := false
+	for _, raw := range msgs {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		content, ok := m["content"]
+		if !ok {
+			continue // 无 content 字段（如空 assistant），不动
+		}
+		arr, ok := content.([]any)
+		if !ok {
+			continue // content 已是 string（或 null），无需处理
+		}
+		joined, safe := flattenTextBlocks(arr)
+		if !safe {
+			continue // 含非文本块，保留原 array
+		}
+		m["content"] = joined
+		changed = true
+	}
+	if !changed {
+		return body
+	}
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return body
+	}
+	if !json.Valid(out) {
+		return body
+	}
+	return out
+}
+
+// flattenTextBlocks 把 OpenAI 多模态 content 数组扁平化为纯文本。
+// 仅当每个元素都是 text 块（{"type":"text","text":...}）或纯字符串时安全返回 true；
+// 一旦遇到 image_url / audio / 其他 type 或缺少 text 的块，返回 false（调用方保留原 array）。
+// 多个 text 块按出现顺序直接拼接（块间不加额外分隔，保守不改变语义）。
+func flattenTextBlocks(arr []any) (string, bool) {
+	var sb strings.Builder
+	for _, el := range arr {
+		switch v := el.(type) {
+		case string:
+			sb.WriteString(v)
+		case map[string]any:
+			if t, _ := v["type"].(string); t == "text" {
+				txt, ok := v["text"].(string)
+				if !ok {
+					return "", false // text 块但 text 非字符串，不安全
+				}
+				sb.WriteString(txt)
+			} else {
+				return "", false // 非 text 块（image_url 等），保留 array
+			}
+		default:
+			return "", false
+		}
+	}
+	return sb.String(), true
+}
 
 // hopByHop 逐跳首部，不能原样透传。
 var hopByHop = map[string]bool{
@@ -376,11 +532,16 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 		}
 	}
 	// 剥离客户端注入的 <content_policy> 段（省 token；纯字节替换，远轻于 gzip 的 ~1ms）。
-	// 只在开关开启时执行，且仅当确实匹配到才替换（避免无谓拷贝）。
+	// stripContentPolicy 内部做 JSON 字符串感知 + json.Valid 兜底，不会破坏请求体。
 	if s.StripContentPolicy {
-		if stripped := contentPolicyRe.ReplaceAll(body, nil); len(stripped) != len(body) {
-			body = stripped
-		}
+		body = stripContentPolicy(body)
+	}
+	// 归一化 OpenAI 路径 content：WorkBuddy 发来的 messages[].content 可能是 array
+	// （多模态 blocks），而 agnes 的 OpenAI 端 schema 要求 content 为 string（v1.0.26
+	// 线上实证：array 触发 400 "Type mismatch ... 'array' not in 'string'"）。仅 OpenAI
+	// 路径（!Anthropic）归一化；纯文本块安全合并，含图/音块则保留原 array（不丢不编造）。
+	if !opts.Anthropic {
+		body = normalizeContentArray(body)
 	}
 	sendBody := body
 	gzipEncode := false

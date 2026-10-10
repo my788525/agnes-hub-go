@@ -57,6 +57,10 @@ type Metrics struct {
 	// LastSuccessNS 全局最近一次上游成功的 UnixNano 时间戳，
 	// 供 /healthz 的 last_success_age_ms（「最近多久有流量真正跑通」）观测。
 	LastSuccessNS atomic.Int64
+	// BudgetExhausted 累计「因日预算耗尽而从候选池剔除」的次数（观测日预算门禁命中频率）。
+	BudgetExhausted atomic.Int64
+	// BudgetDayRollovers 累计「跨天自动清零日预算」次数（观测滚动是否生效）。
+	BudgetDayRollovers atomic.Int64
 	StartedAt     time.Time
 }
 
@@ -589,6 +593,13 @@ func (h *Hub) Candidates(poolClass string, exclude map[string]bool, requiredMode
 		if !h.Capable(a, poolClass) {
 			continue
 		}
+		// 日预算门禁：当天日预算（neurons / tokens）耗尽的账号自动从候选池剔除，
+		// 次日 00:00 跨天滚动清零后自动回池。这是「用量型账号烧光 → 流量全涌向速率型
+		// 账号 → 次日用量型自动复活」的自动切换核心。读的是快照深拷贝（最多滞后 30s，
+		// 对天级预算尺度无影响），无需额外锁。
+		if a.BudgetExhausted() {
+			continue
+		}
 		base = append(base, a)
 	}
 	if requiredModel != "" && len(base) > 0 {
@@ -646,6 +657,7 @@ func (h *Hub) StartMaintenance(ctx context.Context) {
 							log.Printf("[panic-recovered] maintenance tick: %v\n%s", e, debug.Stack())
 						}
 					}()
+					h.rollDailyBudgets()
 					h.flushFactors()
 					h.maybeAutoScenario()
 				}()
@@ -679,6 +691,20 @@ func (h *Hub) flushFactors() {
 	h.store.FlushKeys()
 	h.store.FlushUsage()
 	h.store.FlushBindings()
+}
+
+// rollDailyBudgets 维护循环调用：跨天时把各账号的日预算归属日滚动到「今天」，
+// 耗尽的账号当天累计清零、次日自动重新入池（配合 Candidates 的预算门禁实现
+// 「烧光自动出局 / 次日自动复活」）。同一自然日只滚动一次（幂等），正常挂机
+// 一天顶多触发一次（30s 一跳里绝大多数是空转）。
+func (h *Hub) rollDailyBudgets() {
+	day := config.TodayKey()
+	rolled := h.store.RollDailyBudgets(day)
+	if len(rolled) > 0 {
+		h.Metrics.BudgetDayRollovers.Add(int64(len(rolled)))
+		log.Printf("[budget-roll] 跨天滚动 %d 个账号的日预算：%v", len(rolled), rolled)
+		h.Reload() // 让 pacer/sem 与候选池拾取清零后的账号
+	}
 }
 
 // maybeAutoScenario 维护循环调用（#24）：AutoScenario 开启时，按实时负载画像推荐
@@ -822,6 +848,7 @@ func (h *Hub) pickWithPriority(poolClass string, exclude map[string]bool, requir
 	for _, a := range h.Candidates(poolClass, exclude, requiredModel) {
 		sc := pickScore{
 			priority:    a.Priority,
+			budgetTier:  h.budgetTier(a, s.RoutingMode),
 			regionMatch: config.IsCNHost(a.BaseURL) == primaryCN,
 			wait:        h.Pacer(a, poolClass).ProjectedWait(),
 			inflight:    h.Inflight(a.ID),
@@ -836,6 +863,7 @@ func (h *Hub) pickWithPriority(poolClass string, exclude map[string]bool, requir
 // pickScore 是候选账号的排序评分；betterThan 越大越优。
 type pickScore struct {
 	priority    int
+	budgetTier  int // 0 = 更优先（按 RoutingMode 决定速率型/用量型谁先被吃），1 = 兜底
 	regionMatch bool
 	wait        time.Duration
 	inflight    int
@@ -845,6 +873,10 @@ func (s pickScore) betterThan(o pickScore) bool {
 	if s.priority != o.priority {
 		return s.priority > o.priority
 	}
+	// 路由偏好（RoutingMode）：同一优先级内，先吃「更该用的那一类」。
+	if s.budgetTier != o.budgetTier {
+		return s.budgetTier < o.budgetTier
+	}
 	if s.regionMatch != o.regionMatch {
 		return s.regionMatch // 同优先级内首选区域更优
 	}
@@ -852,6 +884,31 @@ func (s pickScore) betterThan(o pickScore) bool {
 		return s.wait < o.wait
 	}
 	return s.inflight < o.inflight
+}
+
+// budgetTier 依据 RoutingMode 给账号打「预算偏好层」：
+//
+//	- rate_first（默认）：速率型（无日预算，agnles）tier 0 主力，用量型（有日预算，CF）tier 1 兜底；
+//	- budget_first：用量型 tier 0 先烧免费配额，速率型 tier 1 兜底；
+//	- balanced / 未知：一律 tier 0（不做偏好，纯按区域/等待/在途排，等同旧行为）。
+//
+// 注意：预算已耗尽的账号在 Candidates 阶段已被剔除，这里只处理「仍有余量的两类」。
+func (h *Hub) budgetTier(a *config.Account, mode string) int {
+	hasBudget := a.DailyBudget > 0
+	switch mode {
+	case "budget_first":
+		if hasBudget {
+			return 0
+		}
+		return 1
+	case "rate_first":
+		if hasBudget {
+			return 1
+		}
+		return 0
+	default: // balanced / 空值
+		return 0
+	}
 }
 
 // Pick 选择账号。
@@ -1293,6 +1350,33 @@ func (h *Hub) NoteSuccess(a *config.Account) {
 	h.Metrics.RequestsOK.Add(1)
 	// P1-4：全局最近成功时间戳（/healthz last_success_age_ms）。
 	h.Metrics.LastSuccessNS.Store(time.Now().UnixNano())
+}
+
+// ChargeBudget 记录一次成功请求消耗的预算（neurons 或 tokens），推进日预算累计。
+//
+// 走热路径：只改内存（MutateAccountNoSave），由 30s 维护循环
+// flushFactors → FlushAccounts 批量落盘；挂机丢 ≤30s 可接受。
+// 当账号日预算从「未耗尽」翻转为「耗尽」时，记一条 BudgetExhausted 指标 + 日志。
+// 该账号随后在下一轮 Candidates 筛选中被预算门禁自动剔除（次日 00:00 回池）。
+// 没设日预算的账号（DailyBudget<=0）恒为 no-op，对 agnes 零影响。
+func (h *Hub) ChargeBudget(accountID string, delta float64) {
+	if accountID == "" || delta <= 0 {
+		return
+	}
+	var wasExhausted, nowExhausted bool
+	_ = h.store.MutateAccountNoSave(accountID, func(a *config.Account) bool {
+		if a.DailyBudget <= 0 {
+			return false // 没设日预算，不记账
+		}
+		wasExhausted = a.BudgetExhausted()
+		_, _ = a.AddBudgetUsage(delta)
+		nowExhausted = a.BudgetExhausted()
+		return true
+	})
+	if !wasExhausted && nowExhausted {
+		h.Metrics.BudgetExhausted.Add(1)
+		log.Printf("[budget] 账号 %s 当日预算耗尽，自动出局（次日 00:00 回池）", accountID)
+	}
 }
 
 // ---------------------------------------------------------------------------

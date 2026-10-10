@@ -1215,6 +1215,10 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 		raw := result.ReadAll()
 		if result.Status < 400 {
 			s.Store.ChargeKey(item.Key, extractUsage(raw))
+			// 用量型账号（如 CF）把本次消耗记账到日预算，烧光自动出局（次日回池）。
+			if s.Hub != nil && result.Account != nil {
+				s.Hub.ChargeBudget(result.Account.ID, extractNeurons(raw))
+			}
 			s.logUsageFull(item, decision, opts.PoolClass, opts.Path, false, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text)
 		} else {
 			s.logUsageError(item, decision, opts.PoolClass, opts.Path, false, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text, result.Status, string(raw))
@@ -1517,6 +1521,21 @@ func extractUsage(raw []byte) int64 {
 		}
 	}
 	return 0
+}
+
+// extractNeurons 从 OpenAI 兼容响应体解析 Cloudflare 的用量计费字段 usage.neurons。
+// 非 Cloudflare 上游没有该字段，解析不到返回 0 —— 对其他账号（agnles 等）零影响，
+// 只有配了 daily_budget + budget_unit=neurons 的用量型账号才会计账。
+func extractNeurons(raw []byte) float64 {
+	var probe struct {
+		Usage struct {
+			Neurons float64 `json:"neurons"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal(raw, &probe) != nil {
+		return 0
+	}
+	return probe.Usage.Neurons
 }
 
 // sseTail 在转发 SSE 流给客户端的同时，保留末尾片段用于解析流末的 usage。

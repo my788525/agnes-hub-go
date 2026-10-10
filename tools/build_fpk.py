@@ -318,6 +318,9 @@ exit 0
 TRIVIAL = "#!/bin/bash\nexit 0\n"
 
 CHANGELOG = (
+    "1.0.25→1.0.26：strip_content_policy 默认开启——网关默认在转发前剥离客户端注入的 "
+    "<content_policy> 段以省 token（高轮次会话每轮重复、约 100~400 词），对 <user_query> "
+    "真实输入与其余字段零改动；如需保留原始正文送上游可手动关闭（setopt strip_content_policy off）。"
     "1.0.24→1.0.25：修复 gzip 默认开启（v1.0.23）引入的测试桩回归，并补效率/省 token 项。"
     "① 修正 mock 测试桩读上游请求体不解压 gzip 的问题（web 包一批 e2e 因此 400，现全绿）；"
     "② IsAutoModel 补认识默认统一模型名 agnes-auto（此前被当显式模型名原样透传上游致 400，"

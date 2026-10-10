@@ -178,6 +178,23 @@ type Account struct {
 	// Priority 调用优先级（数字越大越优先）。同优先级内按「首选区域 → 预计等待 → 在途」排序。
 	// 默认 0。用于手动把某些账号顶到前面（例如更稳的渠道、或想优先吃满的账号）。
 	Priority            int                `json:"priority"`
+
+	// ---- 每日用量预算（长尺度限流，与 RPM 节拍正交）----
+	//
+	// 有些上游的瓶颈不是「每分钟多少次」（速率墙），而是「每天多少用量」（预算墙），
+	// 典型如 Cloudflare Workers AI 的每日 neurons 免费额度。RPM pacer 只管短尺度（分钟），
+	// 若按 RPM 猛打会在几小时内烧光当天预算、触发上游超额报错。
+	// 故新增一个日预算维度：账号累计用量达到 DailyBudget 后，当天自动从候选池剔除
+	// （自动切到其他账号 / 其他池），次日 00:00 滚动清零重新可用。
+	//
+	// DailyBudget  ≤ 0 表示「不设日预算」，完全退回旧的 RPM 行为（向后兼容 agnes）。
+	// BudgetUnit   计量单位："neurons"（Cloudflare）或 "tokens"（按 token 计的池）。
+	// BudgetUsedToday / BudgetDay 是「按自然日累计的用量」，跨天（BudgetDay != 今天）自动清零。
+	DailyBudget     float64 `json:"daily_budget,omitempty"`
+	BudgetUnit      string  `json:"budget_unit,omitempty"`
+	BudgetUsedToday float64 `json:"budget_used_today,omitempty"`
+	// BudgetDay 是 BudgetUsedToday 所属的自然日（本地时区 YYYY-MM-DD），用于跨天判定。
+	BudgetDay string `json:"budget_day,omitempty"`
 }
 
 // DownstreamKey 是签发给客户端的中转密钥。
@@ -351,12 +368,23 @@ type Settings struct {
 	// StripContentPolicy 开启后，网关在把请求体发给上游前，剥离 WorkBuddy 客户端
 	// 注入的 <content_policy> 段（纯字符串替换，~0.1ms/请求，远轻于 gzip 的 1ms）。
 	// 目的不是省速度，而是省 token：高轮次会话里该段每轮重复、约占 100~400 词，
-	// 剥离可削减送模型的正文量。默认 false（内容零改动、零风险），仅当确认要省
-	// token 时由运维开启。绝不触碰 <user_query> 内的真实输入，也不改动其余字段。
+	// 剥离可削减送模型的正文量。默认 true（省 token；对 <user_query> 真实输入与
+	// 其余字段零改动）；若需保留原始正文送上游可手动关闭（setopt strip_content_policy off）。
 	StripContentPolicy bool `json:"strip_content_policy"`
+	// RoutingMode 决定「有日预算的用量型账号（如 Cloudflare）」与「无天花板的速率型账号
+	// （如 agnes）」混挂时谁先被吃：
+	//   - "rate_first"  （默认）优先速率型主力、用量型兜底 —— 最稳，agnles 扛主力、
+	//     CF 只在 agnes 拥堵/全熔断时顶上，且 CF 烧光当天自动出局、次日回池；
+	//   - "budget_first" 优先烧用量型免费配额（CF 烧光就自动让位 agnes，次日 00:00 自动回池）；
+	//   - "balanced" 不做偏好，纯按 priority→区域→投影等待→在途 排（与旧行为一致）。
+	// 无论哪种，「预算耗尽 → 当天自动从候选池剔除、次日自动回池」的不变量都成立。
+	RoutingMode string `json:"routing_mode"`
 	ChatPasswordHash     string `json:"chat_password_hash,omitempty"`
 	ChatPasswordSalt     string `json:"chat_password_salt,omitempty"`
 }
+
+// RoutingModes 是 RoutingMode 的合法取值。
+var RoutingModes = []string{"rate_first", "budget_first", "balanced"}
 
 // DefaultSettings 返回出厂设置。
 func DefaultSettings() Settings {
@@ -421,6 +449,11 @@ func DefaultSettings() Settings {
 		RateLimitWaitBudgetMS: 180000, // 429 内部重试总等待预算 3 分钟，超时才透传
 		// #29：发往上游的请求体默认 gzip 压缩（已验证上游 agnes 兼容解压，见 #29）。
 		UpstreamRequestGzip: true,
+		// 默认剥离客户端注入的 <content_policy> 段以省 token（对 user_query 真实输入零改动）。
+		StripContentPolicy: true,
+		// 混挂「用量型（CF 有日预算）」与「速率型（agnles 无天花板）」时：agnles 扛主力、
+		// CF 兜底且烧光自动出局。这是最稳的挂机默认。
+		RoutingMode: "rate_first",
 	}
 }
 
@@ -905,6 +938,63 @@ func normalizeAccount(a *Account, s Settings) {
 	if a.ModelManifest.Video == nil {
 		a.ModelManifest.Video = append([]string(nil), s.ModelManifestDefault.Video...)
 	}
+	// 日预算字段归一化：BudgetUnit 空值按 "neurons"（Cloudflare 默认口径）。
+	if a.BudgetUnit == "" {
+		a.BudgetUnit = "neurons"
+	}
+	// 跨天滚动：BudgetUsedToday 是按「自然日」累计的，若归属日不是今天，自动清零重新计。
+	// 归一化阶段做一遍兜底（读盘即滚），运行期再由 hub 维护循环到点滚动（不重启也生效）。
+	a.rollBudgetDay(todayKey())
+}
+
+// todayKey 返回本地时区的自然日键（YYYY-MM-DD），作为「日预算周期」的边界标识。
+func todayKey() string {
+	return time.Now().Format("2006-01-02")
+}
+
+// TodayKey 是 todayKey 的导出版，供 hub 包跨包做日预算跨天判定（候选筛选 / 维护循环）。
+func TodayKey() string { return todayKey() }
+
+// rollBudgetDay 当预算归属日不是指定日时清零当天累计（跨天滚动）。
+// 返回是否发生了滚动（调用方可据此触发落盘 / 重新入池）。
+func (a *Account) rollBudgetDay(dayKey string) bool {
+	if a.DailyBudget <= 0 {
+		return false // 没设预算，无滚动可言
+	}
+	if a.BudgetDay != dayKey {
+		a.BudgetDay = dayKey
+		a.BudgetUsedToday = 0
+		return true
+	}
+	return false
+}
+
+// AddBudgetUsage 累加一次用量（记账成功后调用）。返回 (是否已达标、是否发生跨天重置)。
+func (a *Account) AddBudgetUsage(delta float64) (exhausted bool, rolled bool) {
+	rolled = a.rollBudgetDay(todayKey())
+	if delta > 0 {
+		a.BudgetUsedToday += delta
+	}
+	if a.DailyBudget > 0 && a.BudgetUsedToday >= a.DailyBudget {
+		exhausted = true
+	}
+	return exhausted, rolled
+}
+
+// BudgetExhausted 该账号当天日预算是否已用尽（未设预算恒为 false）。
+func (a *Account) BudgetExhausted() bool {
+	return a.DailyBudget > 0 && a.BudgetUsedToday >= a.DailyBudget
+}
+
+// BudgetRemaining 当天剩余日预算（未设预算返回 0 表示「无限额」）。
+func (a *Account) BudgetRemaining() float64 {
+	if a.DailyBudget <= 0 {
+		return 0
+	}
+	if r := a.DailyBudget - a.BudgetUsedToday; r > 0 {
+		return r
+	}
+	return 0
 }
 
 // ---- 原子写 ----
@@ -1089,6 +1179,25 @@ func (s *Store) FlushAccounts() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_ = s.saveAccountsLocked()
+}
+
+// RollDailyBudgets 把所有账号的日预算归属日滚动到指定自然日（本地时区今天）。
+// 归属日 != dayKey 的账号当天累计清零重新计。返回发生滚动的账号 ID 列表
+// （调用方据此决定是否落盘 + 记录 BudgetDayRollovers 指标）。
+// 维护循环（30s 一跳）到点调用一次即可，无需重启。
+func (s *Store) RollDailyBudgets(dayKey string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var rolled []string
+	for _, a := range s.Accounts {
+		if a.rollBudgetDay(dayKey) {
+			rolled = append(rolled, a.ID)
+		}
+	}
+	if len(rolled) > 0 {
+		_ = s.saveAccountsLocked()
+	}
+	return rolled
 }
 
 // MutateAccountNoSave 在写锁内改账号但不落盘（由调用方负责标 dirty / 定时落盘）。
