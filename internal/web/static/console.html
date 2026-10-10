@@ -1005,7 +1005,8 @@ function bindSettingsEvents(){
 }
 
 /* ---------------- 实时动态图表（运行实况 · 总览第二屏） ---------------- */
-const LIVE = { timer:null, win:"60s", hist:null, meta:[] };
+const LIVE = { timer:null, win:"60s", hist:null, meta:[],
+                barCur:null, barMoving:false, barDirty:true, barRaf:null };
 function liveWantPoints(){ return LIVE.win==="30s"?30:(LIVE.win==="5m"?300:(LIVE.win==="1h"?360:60)); }
 function liveUseCoarse(){ return LIVE.win==="1h"; }
 
@@ -1022,7 +1023,7 @@ function liveSection(){
     </div>
     <div class="live-card">
       <h3>① 多账号分配 <span class="muted" style="font-weight:400;font-size:12px">（各账号完成的请求占比）</span></h3>
-      <div class="sub2">一眼看出「活都让谁干了」，色块上直接标账号名；某颜色消失 = 该账号被限流 / 冷却 / 熔断中。</div>
+      <div class="sub2">Y 轴 = 账号名，X 轴 = 该账号在窗口内完成的请求占比；条形长度每秒平滑滑动，一眼看出「活都让谁干了」。某个条消失 = 该账号被限流 / 冷却 / 熔断中。</div>
       <canvas class="live-canvas" id="cvAcc"></canvas>
       <div class="live-legend" id="lgAcc"></div>
     </div>
@@ -1107,74 +1108,102 @@ function drawLines(cv, series, opts){
   });
 }
 
-// drawStack：多账号分配堆叠面积（每秒归一化到 100%）
-function drawStack(cv, meta, cols, events){
+// drawAccountBars：多账号分配动态直方图（Y 轴 = 账号名，X 轴 = 该账号完成占比 %）
+//
+// 条形长度用缓动插值向最新采样值滑动：数据每秒更新一次，但视觉上是连续滑动的动画，
+// 不会每秒硬跳。行数随账号数自适应，行高不足时压缩条高、隐藏数值避免文字叠行。
+function drawAccountBars(cv, meta, cols, events){
   const {ctx,w,h}=setupCanvas(cv);
-  const padL=6,padR=6,padT=8,padB=18;
-  const plotW=w-padL-padR, plotH=h-padT-padB;
-  const n=cols.length||0;
-  ctx.strokeStyle="rgba(140,140,140,.22)"; ctx.lineWidth=1;
-  for(let g=1;g<4;g++){
-    const y=padT+plotH*g/4;
-    ctx.beginPath(); ctx.moveTo(padL,y); ctx.lineTo(w-padR,y); ctx.stroke();
-  }
-  if(n<2||!meta.length){ emptyHint(cv,"采样中…"); return; }
-  const totalAll=cols.reduce((a,c)=>a+c.reduce((x,y)=>x+y,0),0);
-  if(totalAll<=0){
-    ctx.globalAlpha=.55; ctx.fillStyle=inkColor(); ctx.font="12px sans-serif"; ctx.textAlign="center";
-    ctx.fillText("窗口内没有完成任何请求（空闲中）", w/2, h/2-6); ctx.globalAlpha=1;
-  }
-  const xAt=i=>padL+(n>1?(i/(n-1))*plotW:0);
-  let prev=new Array(n).fill(0);
-  const placed=[]; // 已放置标签的位置（防重叠）
-  for(let k=0;k<meta.length;k++){
-    const cur=new Array(n);
-    for(let i=0;i<n;i++){
-      const tot=cols[i].reduce((a,b)=>a+b,0)||0;
-      cur[i]=prev[i]+(tot>0?(cols[i][k]||0)/tot:0);
-    }
-    ctx.beginPath();
-    for(let i=0;i<n;i++){ const x=xAt(i),y=padT+plotH-cur[i]*plotH; if(i===0)ctx.moveTo(x,y); else ctx.lineTo(x,y); }
-    for(let i=n-1;i>=0;i--){ const x=xAt(i),y=padT+plotH-prev[i]*plotH; ctx.lineTo(x,y); }
-    ctx.closePath();
-    ctx.fillStyle=meta[k].color||"#2f6fd6"; ctx.globalAlpha=.82; ctx.fill(); ctx.globalAlpha=1;
+  const rows=(meta||[]).length;
+  if(!rows){ emptyHint(cv,"采样中…"); return; }
 
-    // 在色块上直接标注账号名：选该账号「最厚」的列（尖峰必然标在峰值处，持续流量的
-    // 宽带也稳定落在最厚处，不会每秒左右跳）；带厚 >=8px 才画（文字 11px 高，再薄会
-    // 与上下带的文字叠成一团）。与已放置标签过近时向下偏移一次，仍过近则放弃。
-    let li=-1, best=0;
-    for(let i=0;i<n;i++){
-      const th=(cur[i]-prev[i])*plotH;
-      if(th>best){ best=th; li=i; }
-    }
-    if(li>=0&&best>=8){
-      const cx=Math.max(padL+26, Math.min(w-padR-26, xAt(li)));
-      let cy=padT+plotH-(prev[li]+(cur[li]-prev[li])/2)*plotH;
-      let blocked=placed.find(p=>Math.abs(p.x-cx)<46&&Math.abs(p.y-cy)<13);
-      if(blocked){ cy+=14; blocked=placed.find(p=>Math.abs(p.x-cx)<46&&Math.abs(p.y-cy)<13); }
-      if(!blocked){
-        placed.push({x:cx,y:cy});
-        let label=meta[k].name||meta[k].id||"";
-        if(label.length>12) label=label.slice(0,11)+"…";
-        ctx.font="600 11px sans-serif";
-        ctx.textAlign="center"; ctx.textBaseline="middle";
-        ctx.lineWidth=3; ctx.lineJoin="round";
-        ctx.strokeStyle="rgba(0,0,0,.45)"; ctx.strokeText(label,cx,cy); // 描边保证浅色带也看得清
-        ctx.fillStyle="#fff"; ctx.fillText(label,cx,cy);
-        if(best>=30){ // 带厚足够时顺带标百分比
-          const pct=Math.round((cur[li]-prev[li])*100)+"%";
-          ctx.font="10px sans-serif";
-          ctx.strokeText(pct,cx,cy+12); ctx.fillText(pct,cx,cy+12);
-        }
-      }
-    }
-    prev=cur;
+  const padT=8, padB=18, padR=46;
+  const padL=Math.max(54, Math.min(116, Math.round(w*0.22)));
+  const plotW=Math.max(20, w-padL-padR), plotH=Math.max(20, h-padT-padB);
+
+  // 窗口内各账号完成总量 → 占比
+  const sums=new Array(rows).fill(0);
+  for(const col of cols){ for(let k=0;k<rows;k++){ sums[k]+=(col[k]||0); } }
+  const total=sums.reduce((a,b)=>a+b,0);
+  const shares=sums.map(v=> total>0 ? v/total : 0);
+
+  // 缓动：当前显示值向目标值滑动（首帧直接对齐，避免从 0 长出来）
+  if(!LIVE.barCur || LIVE.barCur.length!==rows){ LIVE.barCur=shares.slice(); }
+  let moving=false;
+  for(let k=0;k<rows;k++){
+    const d=shares[k]-LIVE.barCur[k];
+    if(Math.abs(d)>=0.001){ moving=true; LIVE.barCur[k]+=d*0.28; }
+    else { LIVE.barCur[k]=shares[k]; }
   }
+  LIVE.barMoving=moving;
+
+  const peak=shares.reduce((a,b)=>Math.max(a,b),0);
+  const xMax=Math.max(0.25, Math.min(1, Math.ceil((peak+0.02)*10)/10));
+  const xAt=v=>padL+Math.min(1,Math.max(0,v/xMax))*plotW;
+
+  // 竖向网格 + x 轴百分比刻度
+  ctx.font="10px sans-serif"; ctx.textBaseline="top"; ctx.textAlign="center";
+  for(let g=0;g<=4;g++){
+    const v=xMax*g/4, x=xAt(v);
+    ctx.strokeStyle="rgba(140,140,140,.22)"; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(x,padT); ctx.lineTo(x,padT+plotH); ctx.stroke();
+    ctx.fillStyle=inkColor(); ctx.globalAlpha=.6;
+    ctx.fillText(Math.round(v*100)+"%", x, padT+plotH+3);
+    ctx.globalAlpha=1;
+  }
+
+  const rowH=plotH/rows;
+  const barH=Math.max(5, Math.min(18, rowH-3));
+  // 账号多时行高变小：字号跟着缩，低于 13px 就只留条不写数字，避免文字叠行
+  const fs=Math.max(8, Math.min(11, Math.round(rowH-3)));
+  const showVal=rowH>=13;
+  ctx.textBaseline="middle";
+  for(let k=0;k<rows;k++){
+    const y=padT+rowH*(k+0.5);
+    const v=LIVE.barCur[k]||0;
+    const bw=v>0?Math.max(2, v/xMax*plotW):0;
+
+    // 条形
+    if(bw>0){
+      ctx.fillStyle=meta[k].color||"#2f6fd6";
+      ctx.globalAlpha=.85;
+      if(typeof ctx.roundRect==="function"){ ctx.beginPath(); ctx.roundRect(padL, y-barH/2, bw, barH, 3); ctx.fill(); }
+      else { ctx.fillRect(padL, y-barH/2, bw, barH); }
+      ctx.globalAlpha=1;
+    }
+
+    // Y 轴账号名（窗口内零产出的账号淡显，一眼区分「没干活」）
+    ctx.textAlign="right"; ctx.fillStyle=inkColor(); ctx.globalAlpha=(sums[k]>0?1:.45);
+    ctx.font="600 "+fs+"px sans-serif";
+    let nm=meta[k].name||meta[k].id||"";
+    if(nm.length>10) nm=nm.slice(0,9)+"…";
+    ctx.fillText(nm, padL-6, y);
+
+    // 右侧数值
+    if(showVal){
+      ctx.textAlign="left"; ctx.font=fs+"px sans-serif";
+      ctx.globalAlpha=.8;
+      ctx.fillText(Math.round(v*100)+"%", padL+bw+5, y);
+      ctx.globalAlpha=1;
+    }
+  }
+
+  // 事件刻度：429（红）/ 熔断（橙）
+  const n=cols.length;
   (events||[]).forEach((e,i)=>{
     if(!e) return;
-    const x=xAt(i);
+    const x=padL+(n>1? (i/(n-1))*plotW : 0);
     ctx.fillStyle=(e&1)?"#d64545":"#e08a1e";
     ctx.fillRect(x-1, h-padB+3, 2, 6);
+  });
+}
+
+// liveAccCols 把采样点里的每账号 done_delta 摊平成「每列 × 每账号」矩阵。
+function liveAccCols(slice){
+  const meta=LIVE.meta||[];
+  return slice.map(p=>{
+    const byId={}; (p.acc||[]).forEach(a=>{ byId[a.id]=a.done_delta||0; });
+    return meta.map(m=>byId[m.id]||0);
   });
 }
 
@@ -1219,17 +1248,16 @@ function drawLive(){
      <div><b style="color:#e08a1e">${last.queue_depth||0}</b><span>排队</span></div>
      <div><b>${last.r429_pm||0}</b><span>429/分钟</span></div>`;
 
-  // ③ 多账号分配
+  // ③ 多账号分配（动态直方图）
   const meta=LIVE.meta||[];
-  const cols=slice.map(p=>{
-    const byId={}; (p.acc||[]).forEach(a=>{ byId[a.id]=a.done_delta||0; });
-    return meta.map(m=>byId[m.id]||0);
-  });
-  drawStack(cvA,meta,cols,events);
-  const lastCol=cols[cols.length-1]||[];
-  const lt=lastCol.reduce((a,b)=>a+b,0)||0;
+  const cols=liveAccCols(slice);
+  drawAccountBars(cvA,meta,cols,events);
+  // 图例与直方图同口径：窗口内累计完成量占比（不是最后一秒）
+  const sums=new Array(meta.length).fill(0);
+  for(const col of cols){ for(let i=0;i<meta.length;i++){ sums[i]+=(col[i]||0); } }
+  const lt=sums.reduce((a,b)=>a+b,0)||0;
   document.getElementById("lgAcc").innerHTML = meta.map((m,i)=>{
-    const pct = lt>0 ? Math.round((lastCol[i]||0)/lt*100) : 0;
+    const pct = lt>0 ? Math.round((sums[i]||0)/lt*100) : 0;
     return `<span class="lg"><i style="background:${m.color}"></i>${esc(m.name||m.id)} ${pct}%</span>`;
   }).join("") || `<span class="muted">还没有账号</span>`;
 }
@@ -1248,6 +1276,19 @@ function startLiveTimer(){
   LIVE.timer = setInterval(liveTick, 1000);
   document.addEventListener("visibilitychange", ()=>{ if(document.visibilityState==="visible") liveTick(); });
   window.addEventListener("resize", ()=>{ if(state.tab==="overview") drawLive(); });
+  // 直方图缓动：两次采样之间用 rAF 让条形连续滑动（只在总览页且页面可见时绘制，
+  // barMoving 为 false 即已收敛，空转即可）。
+  const loop=()=>{
+    if(state.tab==="overview" && document.visibilityState==="visible" && LIVE.barMoving){
+      const cv=document.getElementById("cvAcc");
+      if(cv && LIVE.meta && LIVE.meta.length && LIVE.hist){
+        const sl=(LIVE.hist.points||[]).slice(-liveWantPoints());
+        drawAccountBars(cv, LIVE.meta, liveAccCols(sl), sl.map(p=>p.events||0));
+      }
+    }
+    LIVE.barRaf=requestAnimationFrame(loop);
+  };
+  LIVE.barRaf=requestAnimationFrame(loop);
 }
 function bindLive(){
   startLiveTimer();
