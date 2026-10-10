@@ -348,6 +348,12 @@ type Settings struct {
 	// 巨大静态前缀（system + tools）做前缀缓存，避免每轮重算 prefill。仅当上游
 	// 兼容 Anthropic 前缀缓存时生效；不兼容时该字段被忽略，内容不受影响（见 #29）。
 	AnthropicPromptCache bool `json:"anthropic_prompt_cache"`
+	// StripContentPolicy 开启后，网关在把请求体发给上游前，剥离 WorkBuddy 客户端
+	// 注入的 <content_policy> 段（纯字符串替换，~0.1ms/请求，远轻于 gzip 的 1ms）。
+	// 目的不是省速度，而是省 token：高轮次会话里该段每轮重复、约占 100~400 词，
+	// 剥离可削减送模型的正文量。默认 false（内容零改动、零风险），仅当确认要省
+	// token 时由运维开启。绝不触碰 <user_query> 内的真实输入，也不改动其余字段。
+	StripContentPolicy bool `json:"strip_content_policy"`
 	ChatPasswordHash     string `json:"chat_password_hash,omitempty"`
 	ChatPasswordSalt     string `json:"chat_password_salt,omitempty"`
 }

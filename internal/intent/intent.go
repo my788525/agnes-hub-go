@@ -172,9 +172,10 @@ func IsAutoModel(name string) bool {
 	if low == "" {
 		return false
 	}
-	// 内置 auto 名称集合
+	// 内置 auto 名称集合。agnes-auto 是 config.AutoModelName 默认值 + 控制台聊天页
+	// 默认模型名，必须视为 auto（否则会被当显式模型名原样透传给上游而 400）。
 	autoNames := map[string]bool{
-		"auto": true, "auto-all": true,
+		"auto": true, "auto-all": true, "agnes-auto": true,
 	}
 	if autoNames[low] {
 		return true

@@ -318,6 +318,16 @@ exit 0
 TRIVIAL = "#!/bin/bash\nexit 0\n"
 
 CHANGELOG = (
+    "1.0.24→1.0.25：修复 gzip 默认开启（v1.0.23）引入的测试桩回归，并补效率/省 token 项。"
+    "① 修正 mock 测试桩读上游请求体不解压 gzip 的问题（web 包一批 e2e 因此 400，现全绿）；"
+    "② IsAutoModel 补认识默认统一模型名 agnes-auto（此前被当显式模型名原样透传上游致 400，"
+    "与 config.AutoModelName 默认值及控制台聊天页默认名自相矛盾）；"
+    "③ 新增可开关的 strip_content_policy（默认关）：转发前纯字符串剥离客户端注入的 "
+    "<content_policy> 段，省 token 而非省速度（~0.1ms/请求，远轻于 gzip），绝不触碰 user_query 真实输入；"
+    "④ 上游连接池 idle 超时 90s→5min，减少 agentic 编码任务两轮间隙连接被回收后的 TLS 重建成本；"
+    "⑤ 清理 relay.Do 循环后不可达死代码与冗余 last 变量，go vet 归零。"
+    "另澄清：P0 前缀缓存 addAnthropicCacheControl 早已有 opts.Anthropic 守卫，agnes 主路径（OpenAI 风格）"
+    "本不跑其 JSON round-trip，无浪费，本版未改动。"
     "1.0.23→1.0.24：失败请求可观测性——usage.jsonl 新增 phase=error 记录。"
     "此前只记成功请求，「502 上游连接失败」类故障在网关侧完全无痕；现于全部失败路径"
     "（非流式/流式 4xx5xx、relay 内部错误、流式心跳路径）落错误日志（含 status、错误摘要、"

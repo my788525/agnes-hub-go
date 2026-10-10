@@ -17,11 +17,11 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,6 +39,12 @@ var RetryableStatus = map[int]bool{
 
 // AuthFailStatus 不可重试、必须熔断的状态码。
 var AuthFailStatus = map[int]bool{401: true, 403: true, 402: true}
+
+// contentPolicyRe 匹配客户端（WorkBuddy）注入的 <content_policy>...</content_policy> 段。
+// 只在开关 StripContentPolicy 开启时对上传体做整段剥离：这是纯字节替换（远轻于 gzip 的
+// ~1ms），目的是省 token 而非省速度。该块以 JSON 字符串值形式出现在 messages 里（<> 在
+// JSON 中无需转义、原样保留），整段删除后字符串值变短、仍是合法 JSON，不影响结构。
+var contentPolicyRe = regexp.MustCompile(`(?s)<content_policy>.*?</content_policy>`)
 
 // hopByHop 逐跳首部，不能原样透传。
 var hopByHop = map[string]bool{
@@ -79,8 +85,11 @@ func BuildClientForAccounts(accountCount int) *http.Client {
 	transport := &http.Transport{
 		MaxIdleConns:        maxIdle,
 		MaxIdleConnsPerHost: maxIdlePerHost,
-		IdleConnTimeout:     90 * time.Second,
-		ForceAttemptHTTP2:   true,
+		// agentic 编码任务两轮请求间常有 >90s 的停顿（人在读/思考），idle 连接过早
+		// 回收会让下一轮白白重建一次 TLS 握手。放宽到 5 分钟：短停顿复用既有连接，
+		// 长停顿才重建。NAS 单进程 + 最多 7 账号，idle conn 上限量级很小，持有成本低。
+		IdleConnTimeout:   5 * time.Minute,
+		ForceAttemptHTTP2: true,
 	}
 	return &http.Client{
 		Transport: transport,
@@ -252,7 +261,6 @@ func Do(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) (*Re
 
 	exclude := map[string]bool{}
 	var totalWait int64
-	var last *Result
 	var rl429Used int    // 已用 429 内部重试次数
 	var rl429WaitMS int64 // 429 内部重试累计退避等待（ms），受预算约束
 	// 记录一次到达，供控制台「到达密度 vs 节拍」观测。
@@ -290,7 +298,6 @@ func Do(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) (*Re
 		if err != nil {
 			return nil, err
 		}
-		last = result
 
 		if !retry {
 			if result.Status < 400 {
@@ -335,10 +342,6 @@ func Do(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) (*Re
 		h.Metrics.WaitMS.Add(result.WaitMS)
 		return result, nil
 	}
-	if last == nil {
-		return nil, errors.New("没有可用账号完成该请求")
-	}
-	return last, nil
 }
 
 // attemptOnce 单次尝试。返回 (结果, 是否应重试, 致命错误)。
@@ -370,6 +373,13 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	if opts.Anthropic && s.AnthropicPromptCache {
 		if mod, ok := addAnthropicCacheControl(body); ok {
 			body = mod
+		}
+	}
+	// 剥离客户端注入的 <content_policy> 段（省 token；纯字节替换，远轻于 gzip 的 ~1ms）。
+	// 只在开关开启时执行，且仅当确实匹配到才替换（避免无谓拷贝）。
+	if s.StripContentPolicy {
+		if stripped := contentPolicyRe.ReplaceAll(body, nil); len(stripped) != len(body) {
+			body = stripped
 		}
 	}
 	sendBody := body

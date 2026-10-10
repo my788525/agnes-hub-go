@@ -1,6 +1,7 @@
 package web
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -15,6 +16,22 @@ import (
 	"agneshub/internal/hub"
 	"agneshub/internal/relay"
 )
+
+// readGzipAwareBody 读取上游请求体，感知 Content-Encoding: gzip（v1.0.23 起
+// 网关默认对上传体做 gzip 压缩）。真实上游 agnes 能解压 gzip，故 mock 桩也须
+// 同样解压，否则会把压缩体当明文 Unmarshal 出空 payload、误判 model 为空。
+func readGzipAwareBody(r *http.Request) ([]byte, error) {
+	lim := io.LimitReader(r.Body, 1<<20)
+	if r.Header.Get("Content-Encoding") == "gzip" {
+		gz, err := gzip.NewReader(lim)
+		if err != nil {
+			return nil, err
+		}
+		defer gz.Close()
+		lim = io.LimitReader(gz, 1<<20)
+	}
+	return io.ReadAll(lim)
+}
 
 // mockAgnes 是一个「会真的限流」的模拟上游。
 //
@@ -47,7 +64,7 @@ func (m *mockAgnes) hits(path string) int64 { return m.count(path).Load() }
 func (m *mockAgnes) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
-		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		body, _ := readGzipAwareBody(r)
 		var payload map[string]any
 		_ = json.Unmarshal(body, &payload)
 		model, _ := payload["model"].(string)
