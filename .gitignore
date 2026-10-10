@@ -42,3 +42,6 @@ dist/
 
 # NAS SSH 公钥（部署用，绝不入库；.workbuddy/memory 仍保留跟踪，仅忽略此密钥文件）
 .workbuddy/nas_ssh_key
+
+# 一次性 NAS 热更脚本（内含主机与流程细节，不入库）
+.workbuddy/_deploy_*.py

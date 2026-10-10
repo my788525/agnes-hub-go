@@ -117,6 +117,31 @@ def git_push_tag(version: str):
         print(f"  [WARN] git push tag 失败: {push.stderr.strip()}")
 
 
+def release_notes(version: str) -> str:
+    """Release 正文。
+
+    优先读 tools/release_notes.md（每版发版时手写下要点即可，不必再改本脚本），
+    不存在时回退到内置文案，保证脚本永远能跑。
+    """
+    notes_md = os.path.join(ROOT, "tools", "release_notes.md")
+    if os.path.exists(notes_md):
+        with open(notes_md, "r", encoding="utf-8") as f:
+            md = f.read().strip()
+        if md:
+            print("  [notes] 使用 tools/release_notes.md")
+            return md.replace("{{VERSION}}", version)
+    print("  [notes] 未找到 tools/release_notes.md，回退内置文案")
+    return (
+        f"## 白嫖 Hub (Agnes Hub) v{version}\n\n"
+        "多账号聚合中转网关，支持 agnes / AMD / NVIDIA / M365 / OpenRouter 等渠道统一调度与 RPM 限流排队。\n\n"
+        "### 下载\n"
+        f"- `baipiao-hub-{version}.fpk` — 飞牛 fnOS 安装包\n"
+        f"- `agnes-hub-go-windows-{version}.zip` — Windows 绿色版\n"
+        f"- `baipiao-hub-linux-amd64` / `baipiao-hub-linux-arm64` — Linux 二进制\n"
+        f"- `agnes-hub-go.exe` — Windows 裸可执行文件\n"
+    )
+
+
 def github_release(version: str, assets):
     """经 REST API 建 Release + 上传资源。"""
     import requests
@@ -134,23 +159,7 @@ def github_release(version: str, assets):
                         headers=h, proxies=proxies, timeout=30)
         print(f"  [del] 旧 release v{version} (id={rel_id})")
 
-    body = (
-        f"## 白嫖 Hub (Agnes Hub) v{version}\n\n"
-        "多账号聚合中转网关，支持 agnes / AMD / NVIDIA / M365 / OpenRouter 等渠道统一调度与 RPM 限流排队。\n\n"
-        "### 本版主要变更（上游上下文策略 + 用量日志原文显示）\n"
-        "- **新增「上游上下文策略（系统提示词）」**：控制台设置页新增卡片，控制发给上游模型的 system 提示词如何处理。四种模式：转发（默认，零回归）/ 仅剥离 system（最省 token）/ 覆盖为自定义提示词 / 按情景匹配前置提示词。\n"
-        "- **关键边界**：策略【只动 system 提示词内容】，绝不触碰 `tools` / `tool_choice` / `thinking` / `stream` / `stream_options` 等能力字段——工具调用与思考能力始终保留；override 与 scenario 的提示词留空时回退内置「代码生成」默认提示词（面向在 WorkBuddy 上写代码优化）\n"
-        "- **修复用量日志把整段系统提示词当作用户请求**：此前「用户请求」列记录的是发往上游的原始 body（含 ≥8KB 的 WorkBuddy/agnes 系统提示词），现改为只记录用户真正提交的原文（`decision.Prompt.Text`，已排除 system/assistant/tool 上下文），点「查看请求」弹窗显示的就是用户原话\n"
-        "- **修复 requestLog 截断阈值长期硬编码 8192**：现接入配置 `usage_request_log_bytes`（默认 512），让该配置项真正生效\n"
-        "- 延续 v1.0.18：用量日志「用户请求」列改为只保留一个「查看请求」按钮（点击才弹完整请求原文），移除冗余的预览文本与悬停浮层\n"
-        "- 延续 v1.0.17 能力：上游 429 网关内自动重试（换号 + 重新排队 + 感知 Retry-After 退避，不中断客户端在途任务）、429 重试预算随情景走、自动检测接入方负载→一键匹配推荐情景、WorkBuddy 写代码专用情景预设、控制台运行情景一键预设 UI、文本池两级队列（非流式优先）\n"
-        "- 延续 v1.0.14 挂机鲁棒性：流式空闲看门狗、全进程 panic 恢复、日志滚转、优雅停机、429 单 pacer reload、/healthz 富健康度、连接池自适应、视频轮询退避\n\n"
-        "### 下载\n"
-        f"- `baipiao-hub-{version}.fpk` — 飞牛 fnOS 安装包（应用中心安装，应用名「白嫖 Hub」，内部 appname 保持 agnes-hub 以保留已装应用数据）\n"
-        f"- `agnes-hub-go-windows-{version}.zip` — Windows 绿色版（含 exe + 启动脚本 + README）\n"
-        f"- `baipiao-hub-linux-amd64` / `baipiao-hub-linux-arm64` — Linux 二进制（x86_64 / aarch64）\n"
-        f"- `agnes-hub-go.exe` — Windows 裸可执行文件\n"
-    )
+    body = release_notes(version)
     r = requests.post(f"https://api.github.com/repos/{REPO}/releases", headers=h,
                       proxies=proxies, json={"tag_name": f"v{version}", "name": f"v{version}",
                                              "body": body, "draft": False, "prerelease": False},
