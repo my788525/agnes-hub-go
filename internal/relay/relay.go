@@ -209,14 +209,28 @@ func Do(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) (*Re
 	if retryMax < 0 {
 		retryMax = 0
 	}
+	rateLimitRetryMax := s.RateLimitRetryMax
+	if rateLimitRetryMax < 0 {
+		rateLimitRetryMax = 0
+	}
+	// 429 走独立的、更大的重试预算：限流往往只是瞬时拥挤，网关内排队换号重试
+	// 通常能消化，让客户端几乎永远拿不到 429，从而不中断任务。非 429 失败
+	//（5xx / 凭据被拒）仍受通用 retryMax 约束。
+	// 注意：这里绝不动用任何空闲看门狗 / 流式看门狗——那是后期版本导致
+	// 「思考中卡死」的元凶，1.0.40 刻意不引入。
+	maxAttempt := retryMax
+	if rateLimitRetryMax > maxAttempt {
+		maxAttempt = rateLimitRetryMax
+	}
 
 	exclude := map[string]bool{}
 	var totalWait int64
 	var last *Result
+	rlAttempts := 0 // 已发生的 429 重试次数
 	// 记录一次到达，供控制台「到达密度 vs 节拍」观测。
 	h.Arrivals.Add()
 
-	for attempt := 0; attempt <= retryMax; attempt++ {
+	for attempt := 0; attempt <= maxAttempt; attempt++ {
 		picked, err := h.Pick(opts.SessionKey, opts.PoolClass, opts.Pinned, opts.RequiredModel, exclude)
 		if err != nil {
 			return nil, err
@@ -265,7 +279,14 @@ func Do(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) (*Re
 		}
 
 		exclude[account.ID] = true
-		if attempt < retryMax {
+		if result.Status == http.StatusTooManyRequests {
+			// 429 用专享预算 rateLimitRetryMax（默认 8），而非通用 retryMax。
+			rlAttempts++
+			if rlAttempts < rateLimitRetryMax {
+				sleepBackoff(ctx, s, attempt)
+				continue
+			}
+		} else if attempt < retryMax {
 			sleepBackoff(ctx, s, attempt)
 			continue
 		}

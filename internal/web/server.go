@@ -67,6 +67,7 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /healthz", s.handleHealth)
 	m.HandleFunc("GET /v1/models", s.handleModels)
 	m.HandleFunc("GET /metrics", s.handleMetrics)
+	m.HandleFunc("GET /api/metrics-history", s.handleMetricsHistory)
 
 	m.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		s.handleTextish(w, r, "/v1/chat/completions")
@@ -488,6 +489,16 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(sb.String()))
+}
+
+// handleMetricsHistory 返回动态图所需的滚动采样序列（fine=1s 粒度 600 点 / coarse=10s 粒度 360 点）。
+// 控制台每秒轮询一次，前端 canvas 自绘滚动折线 / 堆叠面积图，不依赖任何第三方图表库。
+func (s *Server) handleMetricsHistory(w http.ResponseWriter, r *http.Request) {
+	win := r.URL.Query().Get("win")
+	if win != "coarse" {
+		win = "fine"
+	}
+	writeJSON(w, 200, s.Hub.MetricsHistory(win), nil)
 }
 
 // ---------------------------------------------------------------------------

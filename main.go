@@ -29,7 +29,7 @@ import (
 	"agneshub/internal/web"
 )
 
-var version = "1.0.11"
+var version = "1.1.0"
 
 func env(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -78,6 +78,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	h.StartMaintenance(ctx)
+	h.StartHistory(ctx)
 
 	srv := web.New(store, h, relay.BuildClient())
 	srv.Version = version
@@ -124,6 +125,13 @@ func main() {
 		// 视频提交与长回答的 SSE 流可能持续很久，超时会把正常任务掐断。
 		IdleTimeout: 120 * time.Second,
 	}
+	// 关闭服务端 keep-alive：网关进程重启 / 热更后所有已建立的 keep-alive
+	// 连接会被服务端掐断，但客户端连接池仍视其存活，下一轮请求写进半死连接
+	// 黑洞 → TCP 重传超时十几分钟（这是客户端「思考中卡死」的成因之一）。
+	// 关掉后每个请求走独立 TCP 连接（响应带 Connection: close），客户端
+	// 结构上无法复用上个进程残留的连接。代价：局域网一次握手 <1ms，可忽略；
+	// SSE 流式天然一请求一连接，无影响。
+	httpSrv.SetKeepAlivesEnabled(false)
 
 	settings := store.SettingsSnapshot()
 	enabled := 0

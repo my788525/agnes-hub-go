@@ -295,6 +295,14 @@ type Settings struct {
 	RequestTimeoutMS     int                `json:"request_timeout_ms"` // 单个上游请求超时（ms），0=无限（不推荐）
 	ChatPasswordHash     string             `json:"chat_password_hash,omitempty"`
 	ChatPasswordSalt     string             `json:"chat_password_salt,omitempty"`
+	// RPMGlobalFactor 是作用于「全部账号有效 RPM」的全局系数（默认 1.0）。
+	// 把 1.0 调低（如 0.8）可整体留更多余量、更不易撞上游 429；调高则更激进。
+	// 与按账号 rpm_overrides 独立叠加：effective_rpm = base * safety * learned * factor * RPMGlobalFactor。
+	RPMGlobalFactor float64 `json:"rpm_global_factor"`
+	// RateLimitRetryMax 是专用于 429 的重试预算（默认 8），独立于通用 retry_max（默认 3）。
+	// 429 往往只是瞬时拥挤，网关内排队换号重试通常能消化；给 429 更大的预算，
+	// 让客户端几乎永远拿不到 429，从而不中断任务。
+	RateLimitRetryMax int `json:"rate_limit_retry_max"`
 }
 
 // DefaultSettings 返回出厂设置。
@@ -352,6 +360,8 @@ func DefaultSettings() Settings {
 		VideoMaxCapacity:    200,
 		RegionPriority:      "cn_first",
 		RequestTimeoutMS:    30000, // 默认 30s 上游请求超时
+		RPMGlobalFactor:    1.0,   // 全局 RPM 系数，1.0 = 不额外缩放
+		RateLimitRetryMax:  8,     // 429 专享重试预算，远大于通用 retry_max
 	}
 }
 

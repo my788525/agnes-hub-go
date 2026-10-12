@@ -49,6 +49,7 @@ type Metrics struct {
 	Spillovers     atomic.Int64
 	BreakerOpened  atomic.Int64
 	BreakerRevived atomic.Int64
+	PanicsTotal    atomic.Int64
 	StartedAt      time.Time
 }
 
@@ -75,6 +76,9 @@ type Hub struct {
 
 	// Metrics 是运行指标（/healthz 与控制台观测）。
 	Metrics Metrics
+
+	// hist 是实时动态图表的历史采样器（/api/metrics-history 数据源）。
+	hist *History
 }
 
 // arrivalRing 是固定容量环形时间戳数组（并发安全）。
@@ -273,7 +277,11 @@ func (h *Hub) effectiveRPMLocked(a *config.Account, poolClass string, s config.S
 	if safety <= 0 {
 		safety = 0.9
 	}
-	return math.Max(0.01, base*safety*h.learnedFactorOf(a)*factor)
+	gf := s.RPMGlobalFactor
+	if gf <= 0 {
+		gf = 1
+	}
+	return math.Max(0.01, base*safety*h.learnedFactorOf(a)*factor*gf)
 }
 
 func baseRPM(a *config.Account, poolClass string) float64 {
@@ -729,6 +737,37 @@ func (h *Hub) TrackInflight(accountID string, delta int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.inflight[accountID] = maxInt(0, h.inflight[accountID]+delta)
+}
+
+// InflightTotal 全局在途请求数（所有账号之和）。
+func (h *Hub) InflightTotal() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	t := 0
+	for _, v := range h.inflight {
+		t += v
+	}
+	return t
+}
+
+// QueueDepth 全局排队深度（所有池的等待人数之和）。
+func (h *Hub) QueueDepth() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	t := 0
+	for _, p := range h.pacers {
+		t += p.Waiting()
+	}
+	return t
+}
+
+// Upstream429RatePerMin 上游 429 的每分钟速率（按进程启动以来粗算，够图表用）。
+func (h *Hub) Upstream429RatePerMin() int {
+	up := time.Since(h.Metrics.StartedAt).Minutes()
+	if up <= 0 {
+		return 0
+	}
+	return int(float64(h.Metrics.Upstream429.Load()) / up)
 }
 
 // ---------------------------------------------------------------------------

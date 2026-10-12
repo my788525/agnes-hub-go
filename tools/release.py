@@ -60,10 +60,14 @@ def go_build(env, goos, goarch, out):
 
 
 def embedded_version(binary_path: str) -> set:
-    """提取二进制里嵌入的版本字符串（用于前置校验）。"""
+    """提取二进制里嵌入的版本字符串（用于前置校验）。
+
+    版本号形如 x.y.z（1.0.x / 1.1.x 都匹配），不写死主版本，避免升到 1.1.0
+    时正则 `1\\.0\\.\\d+` 匹配不到导致前置校验误杀。
+    """
     with open(binary_path, "rb") as f:
         data = f.read()
-    return set(m.decode() for m in re.findall(rb"1\.0\.\d+", data))
+    return set(m.decode() for m in re.findall(rb"\d+\.\d+\.\d+", data))
 
 
 def check_version(binary_path: str, expected: str):
@@ -115,6 +119,20 @@ def git_push_tag(version: str):
         print(f"  [WARN] git push tag 失败: {push.stderr.strip()}")
 
 
+def release_body(version: str) -> str:
+    """Release 正文：优先读 tools/release_notes.md（支持 {{VERSION}} 占位），
+    缺失才回退内置文案。发版时只改这个 md，不要再改 release.py 正文
+    （此前正文硬编码在 py 里，导致长期挂着旧版文案）。"""
+    md = os.path.join(ROOT, "tools", "release_notes.md")
+    if os.path.exists(md):
+        with open(md, "r", encoding="utf-8") as f:
+            return f.read().replace("{{VERSION}}", version)
+    return (
+        f"## Agnes Hub v{version}\n\n"
+        f"下载 `agnes-hub-go-{version}.fpk`（飞牛）/ `agnes-hub-go-windows-{version}.zip`（Windows 绿色版）。\n"
+    )
+
+
 def github_release(version: str, assets):
     """经 REST API 建 Release + 上传资源。"""
     import requests
@@ -132,14 +150,7 @@ def github_release(version: str, assets):
                         headers=h, proxies=proxies, timeout=30)
         print(f"  [del] 旧 release v{version} (id={rel_id})")
 
-    body = (
-        f"## Agnes Hub v{version}\n\n"
-        "- 到达密度 vs 节拍观测指标（控制台）\n"
-        "- 意图判定 LRU 缓存（热路径 O(1)）\n"
-        "- 429 路径批量落盘（消除同步磁盘 I/O）\n"
-        "- HTTP 客户端单例化（全应用共享连接池）\n\n"
-        f"下载 `agnes-hub-go-{version}.fpk`（飞牛）/ `agnes-hub-go-windows-{version}.zip`（Windows 绿色版）。\n"
-    )
+    body = release_body(version)
     r = requests.post(f"https://api.github.com/repos/{REPO}/releases", headers=h,
                       proxies=proxies, json={"tag_name": f"v{version}", "name": f"v{version}",
                                              "body": body, "draft": False, "prerelease": False},

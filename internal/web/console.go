@@ -1167,6 +1167,9 @@ func applySettings(st *config.Settings, p map[string]any) {
 	i("retry_max", &st.RetryMax)
 	i("retry_base_backoff_ms", &st.RetryBaseBackoffMS)
 	i("retry_max_backoff_ms", &st.RetryMaxBackoffMS)
+	// 429 专享重试预算：独立于通用 retry_max，让限流几乎永远在网关内消化。
+	f("rpm_global_factor", &st.RPMGlobalFactor)
+	i("rate_limit_retry_max", &st.RateLimitRetryMax)
 	i("image_concurrency", &st.ImageConcurrency)
 	i("video_max_inflight", &st.VideoMaxInFlight)
 	i("breaker_revive_sec", &st.BreakerReviveSec)
