@@ -15,6 +15,14 @@
 - 验证：`curl -s http://127.0.0.1:4142/healthz` 看 `version`/`ok`/`panics_total`；`grep -ac 'truncated?' <binary>` 确认前端修复已嵌入。
 - 保留数据直接替换二进制即可，不走 uninstall；旧 binary 先备份到 `/vol1/@appdata/agnes-hub/app.PRE<时间戳>.bak`。
 
+## 服务端 keep-alive 必须保持关闭（v1.0.37 起，勿"优化"回去）
+`main.go` 对 `httpSrv` 调了 `SetKeepAlivesEnabled(false)`，**这是刻意的，不要当性能问题"优化"回keep-alive**。
+- 起因（2026-10-12 用户 A/B 实测钉死）：改用官方 agnes 直连（同一账号、绕过网关）后「思考中卡死十几分钟、无报错、网关 accepted/pending 全 0」消失，但**速度不变**——证明网关逻辑与上游延迟均无辜，唯一变量是「客户端↔网关」这一段连接。
+- 机理：网关进程重启/热更时所有已建立的 keep-alive 连接被服务端掐断，客户端（WorkBuddy）连接池却仍视其存活，下一轮请求写进半死连接黑洞 → TCP 重传超时十几分钟。**与 CF 隧道那次（见下节）是同一个病的两个触发源**。
+- 关闭后每个请求走独立 TCP 连接（响应带 `Connection: close`），客户端**结构上无法**复用上个进程残留的连接。代价：局域网一次 TCP 握手 <1ms，可忽略；SSE 流式天然一请求一连接，无影响。**只影响「客户端→网关」下行连接**，网关→上游（agnes）的连接复用由 `relay.BuildClientForAccounts` 的 `http.Client` 独立管理，不受影响。
+- 验证手段：`curl -sI http://127.0.0.1:4142/healthz | grep -i connection` 应见 `Connection: close`。
+- **配套运维铁律**：任何网关 hot 重启前先提醒用户停掉在跑的任务；重启后让用户重开会话或切模型再切回。v1.0.37 起 keep-alive 已关，重启不再留半死连接，但重启瞬间的在途请求仍会被切断。
+
 ## 发布流水线（固化）
 - 版本单一来源：`main.go` 的 `var version = "x.y.z"`；`tools/build_fpk.py` 与 `tools/release.py` 都从它读，勿手改两处。
 - `tools/release.py`：交叉编译 linux-amd64/arm64 + windows exe（前置校验嵌入版本==main.go）→ 打 `baipiao-hub-{ver}.fpk` + `agnes-hub-go-windows-{ver}.zip` → tag v{ver} → GitHub Release + 上传 5 资产。
