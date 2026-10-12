@@ -846,6 +846,23 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 			if wd != nil {
 				wd.stop()
 			}
+			// v1.0.39 防护：个别上游站点把「上下文超长」误报成 401 "Invalid token"
+			// （直连同请求则如实报 400 ContextWindowExceededError）。若在此走
+			// OnAuthFailure，会把健康账号熔断禁用 30 分钟；会话上下文一大就轮番
+			// 误杀，最终 no_capacity → 客户端干等（2026-10-12 渐进卡死根因之一）。
+			// 识别到超长信号：改写成 400 直接交还客户端，账号不熔断、不换站
+			//（换站解决不了超长，只会把同样的 401 在别的账号上再犯一遍）。
+			if isContextOverflowError(raw) {
+				<-sem
+				iterCancel()
+				h.NoteError(account, fmt.Sprintf("HTTP %d 但实为上下文超长，不熔断：%s", status, truncateRelay(string(raw), 160)))
+				return &Result{
+					Status:   http.StatusBadRequest,
+					Header:   SanitizeHeaders(resp.Header),
+					Body:     rewriteOverflowBody(raw),
+					Account:  account, ModelUsed: modelUsed, WaitMS: totalWaitMS, Attempts: attemptNo,
+				}, false, nil
+			}
 			// 还有另一官方站点可试（cn_first / com_first / random 且本账号属官方双站）：
 			// 不立即熔断，用同一把 Key 切站重发同一请求，客户端任务不被站点级凭据错打断。
 			if i < len(candidateURLs)-1 {
@@ -1114,6 +1131,71 @@ func gzipBytes(in []byte) ([]byte, bool) {
 		return nil, false
 	}
 	return buf.Bytes(), true
+}
+
+// truncateRelay 截断长字符串用于日志/错误信息（relay 包本地版，hub.truncate 不可跨包）。
+func truncateRelay(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	// 避免切断多字节 UTF-8 字符产生乱码
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
+}
+
+// contextOverflowMarkers 上游「上下文超长」错误的特征串（v1.0.39）。
+// 各站点对超长请求的错误映射不一致：有的如实报 400 ContextWindowExceededError，
+// 有的误报 401 "Invalid token"——后者若走熔断会误杀健康账号（详见 attemptOnce
+// 的 AuthFailStatus 防护注释）。按 body 内容识别，与状态码无关。
+var contextOverflowMarkers = []string{
+	"ContextWindowExceededError",
+	"context_length_exceeded",
+	"ContextWindowExceeded",
+	"longer than the model's context window",
+	"maximum context length",
+	"上下文长度",
+	"输入过长",
+}
+
+// isContextOverflowError 判断上游错误体是否实为「上下文超长」。
+// 只做子串匹配（错误体 ≤4KB，纯小写化后比对开销可忽略），宁漏勿误：
+// 漏判只是维持旧有熔断行为，误判会让真凭证问题不被熔断。
+func isContextOverflowError(raw []byte) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	low := strings.ToLower(string(raw))
+	for _, m := range contextOverflowMarkers {
+		if strings.Contains(low, strings.ToLower(m)) {
+			return true
+		}
+	}
+	return false
+}
+
+// rewriteOverflowBody 把上游的 401 超长错误体改写成对客户端更可理解的 400 错误帧，
+// 保留上游原始 message 供诊断。解析失败时返回通用提示。
+func rewriteOverflowBody(raw []byte) []byte {
+	msg := string(raw)
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err == nil {
+		if e, ok := doc["error"].(map[string]any); ok {
+			if m, ok := e["message"].(string); ok && m != "" {
+				msg = m
+			}
+		}
+	}
+	body, _ := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"code":    "context_window_exceeded",
+			"message": fmt.Sprintf("请求上下文超过模型窗口限制（上游原始信息：%s）。请开启新会话或缩减上下文后重试。", truncateRelay(msg, 300)),
+			"type":    "agnes_hub_context_overflow",
+		},
+	})
+	return body
 }
 
 // addAnthropicCacheControl 在 Anthropic 风格请求体上注入前缀缓存断点（#29 P0）：

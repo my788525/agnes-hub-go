@@ -453,8 +453,15 @@ type Settings struct {
 	RawCaptureEnabled bool `json:"raw_capture_enabled"`
 	// UpstreamRequestGzip 开启后，网关对发往上游的请求体做 gzip 压缩
 	// （Content-Encoding: gzip），削减网关→上游的带宽（WorkBuddy 单请求体常达
-	// ~500KB，gzip 可压到 1/5~1/8）。已验证上游 agnes 兼容解压 gzip 请求体，
-	// 故默认 true（见 #29）；个别不兼容的上游可手动关闭。
+	// ~500KB，gzip 可压到 1/5~1/8）。
+	//
+	// ⚠️ 默认 false（2026-10-12 实测定案，勿再默认开启）：上游 agnes 对「大体积
+	// gzip 请求体」解压失败时返回误导性 401 "Invalid token"（同请求直连、不压缩
+	// 则如实报 400 ContextWindowExceededError）。401 会触发 OnAuthFailure 把账号
+	// 熔断禁用 30 分钟，轮询不断撞上即把账号池抽干 → no_capacity → 客户端干等，
+	// 表现为「会话开头能用、上下文变大后逐渐卡死、重启才恢复」。小请求 gzip 正常，
+	// 所以症状随上下文增长渐进出现。带宽收益远不抵稳定性代价；确需开启请先对
+	// 目标上游做 ≥2MB 请求体的压缩回归测试。
 	UpstreamRequestGzip bool `json:"upstream_request_gzip"`
 	// AnthropicPromptCache 开启后，网关在 Anthropic 风格（/v1/messages）请求体的
 	// 顶层 system 块注入 cache_control:{type:"ephemeral"}，让上游对反复出现的
@@ -549,8 +556,9 @@ func DefaultSettings() Settings {
 		SoftFailRetryMax: 2,
 		// 流式断流 / error 帧自动重连续写，默认开（不让客户端停）
 		StreamAutoResume: true,
-		// #29：发往上游的请求体默认 gzip 压缩（已验证上游 agnes 兼容解压，见 #29）。
-		UpstreamRequestGzip: true,
+		// #29 反悔（2026-10-12 实测）：gzip 默认关闭——上游对大体积 gzip 请求体
+		// 返回误导性 401，触发账号熔断级联（详见字段注释）。要开先做 ≥2MB 回归测试。
+		UpstreamRequestGzip: false,
 		// 默认剥离客户端注入的 <content_policy> 段以省 token（对 user_query 真实输入零改动）。
 		StripContentPolicy: true,
 		// 混挂「用量型（CF 有日预算）」与「速率型（agnles 无天花板）」时：agnles 扛主力、
