@@ -118,6 +118,17 @@ def git_push_tag(version: str):
     if push.returncode != 0:
         print(f"  [WARN] git push tag 失败: {push.stderr.strip()}")
 
+    # 同步把当前 HEAD 推到远端 master，避免仓库只前进 tag 而默认分支落后。
+    pb = subprocess.run(
+        ["git", "push", f"https://{GITHUB_PAT}@github.com/{REPO}.git", "HEAD:refs/heads/master"],
+        cwd=ROOT,
+        env={**os.environ, "HTTPS_PROXY": PROXY, "HTTP_PROXY": PROXY,
+             "https_proxy": PROXY, "http_proxy": PROXY},
+        capture_output=True, text=True,
+    )
+    if pb.returncode != 0:
+        print(f"  [WARN] git push master 失败: {pb.stderr.strip()}")
+
 
 def release_body(version: str) -> str:
     """Release 正文：优先读 tools/release_notes.md（支持 {{VERSION}} 占位），

@@ -269,9 +269,10 @@ type Settings struct {
 	KeepaliveMS          int                `json:"keepalive_interval_ms"`
 	AffinityMode         string             `json:"affinity_mode"`
 	DefaultImageTier     string             `json:"default_image_tier"`
-	// RegionPriority 站点优先级：cn_first（国内优先）或 com_first（国际优先）。
-	// 401/403 凭据被拒时自动切换到另一站点的 BaseURL 重试同一账号。
-	RegionPriority       string             `json:"region_priority,omitempty"`
+	// PriorityOrderMode 控制调度是否「按账号优先级排序来安排调用」。
+	// true（默认）= 优先级高的账号稳定顶到前面（同优先级内再按预计等待/在途兜底）；
+	// false = 退化为纯负载均衡（按预计等待排序，忽略账号优先级）。
+	PriorityOrderMode    bool               `json:"priority_order_mode"`
 	ModelAliases         map[string]string  `json:"model_aliases"`
 	AutoModelName        string             `json:"auto_model_name"`
 	AutoIntent           AutoIntentSettings `json:"auto_intent"`
@@ -358,7 +359,7 @@ func DefaultSettings() Settings {
 		ImageRecordRetention: 30,
 		ImageMaxCapacity:    500,
 		VideoMaxCapacity:    200,
-		RegionPriority:      "cn_first",
+		PriorityOrderMode:   true,   // 默认按账号优先级排序安排调用
 		RequestTimeoutMS:    30000, // 默认 30s 上游请求超时
 		RPMGlobalFactor:    1.0,   // 全局 RPM 系数，1.0 = 不额外缩放
 		RateLimitRetryMax:  8,     // 429 专享重试预算，远大于通用 retry_max

@@ -65,7 +65,8 @@ VERSION = _version_from_main_go()
 # 这里直接取 VERSION，单一来源。
 VERSION_TAG = VERSION
 # 由 VERSION 推导，避免两处手改不同步导致产物名和 manifest 版本对不上。
-FPK_NAME = "baipiao-hub-%s.fpk" % VERSION
+# 文件名对齐 GitHub Release 资产名（agnes-hub-go-*.fpk），便于直接下载安装。
+FPK_NAME = "agnes-hub-go-%s.fpk" % VERSION
 APP_DIR = os.path.join(FPK_DIR, "app")
 CMD_DIR = os.path.join(FPK_DIR, "cmd")
 WIZARD_DIR = os.path.join(FPK_DIR, "wizard")
@@ -322,6 +323,7 @@ CHANGELOG = (
     "429 限流改为网关内自动排队换号重试（专享预算 8 次），客户端几乎永远拿不到 429、任务不中断；"
     "新增全局 RPM 系数（节流与排队设置页，默认 1.0），与按账号 RPM 覆盖独立叠加作用于全部账号有效 RPM；"
     "关闭服务端 keep-alive：网关重启/热更后客户端不再复用上个进程残留的半死连接（另一类「思考中卡死」的成因）；"
+    "新增「按账号优先级排序安排调用」开关（设置页，默认开）：开启时优先级数字大的账号稳定顶到前面，关闭退化为纯负载均衡；移除原「站点优先级（401/403 自动换站）」设置，区域偏好固定为国内优先；"
     "以 1.0.11 为基线，刻意不引入后期版本导致卡死的空闲看门狗与请求体改写。"
     "1.0.11：控制台账号编辑改为完整弹窗（可改名称/Key/BaseURL/类型/分组/并发/优先级/兜底模型/各模态清单/各池 RPM）；"
     "新增「账号调用优先级」与「按账号 RPM 覆盖」（不再统一套用 agnes 20rpm），调度按优先级、区域、预计等待排序；"

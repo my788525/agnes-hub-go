@@ -567,17 +567,21 @@ type PickResult struct {
 
 // pickWithPriority 选择账号：优先级（数字越大越优先）为第一排序键，
 // 同优先级内按「首选区域 → 预计等待 → 在途」排序。这样手动调高的账号会稳定顶到前面，
-// 而区域优先级退化为同优先级内的次级偏好（与「cn_first / com_first」语义一致）。
+// 而区域偏好（国内优先）退化为同优先级内的次级偏好。
 func (h *Hub) pickWithPriority(poolClass string, exclude map[string]bool, requiredModel string) *config.Account {
-	s := h.Settings()
-	primaryCN := s.RegionPriority != "com_first" // 默认 cn_first
+	primaryCN := true // 站点区域偏好固定为国内优先；旧 region_priority 设置已移除
+	usePriority := h.Settings().PriorityOrderMode
 
 	bestAcc := (*config.Account)(nil)
 	bestScore := pickScore{}
 	init := false
 	for _, a := range h.Candidates(poolClass, exclude, requiredModel) {
+		prio := 0
+		if usePriority {
+			prio = a.Priority
+		}
 		sc := pickScore{
-			priority:    a.Priority,
+			priority:    prio,
 			regionMatch: config.IsCNHost(a.BaseURL) == primaryCN,
 			wait:        h.Pacer(a, poolClass).ProjectedWait(),
 			inflight:    h.Inflight(a.ID),

@@ -760,10 +760,7 @@ function viewSettings(){
         <option value="session" ${s.affinity_mode==="session"?"selected":""}>仅按会话头</option>
         <option value="none" ${s.affinity_mode==="none"?"selected":""}>不粘性（纯负载均衡）</option>
       </select><div class="hint">绑定账号拥堵（预计等待 &gt; 3s）或冷却时自动改派并更新绑定</div></div>
-      <div><label>站点优先级（401/403 自动换站）</label><select id="s_region">
-        <option value="cn_first" ${s.region_priority!=="com_first"?"selected":""}>国内优先（api.example.cn 优先，不通则切国际）</option>
-        <option value="com_first" ${s.region_priority==="com_first"?"selected":""}>国际优先（api.example.com 优先，不通则切国内）</option>
-      </select><div class="hint">API Key 被 401/403 拒绝时自动切到另一站点重试，成功后持久化该账号的 base_url</div></div>
+      <div><label>按账号优先级排序安排调用</label><label class="chk" style="display:inline-flex;gap:6px;align-items:center;margin-top:6px"><input type="checkbox" id="s_priority_mode" ${s.priority_order_mode?"checked":""}> 启用（优先级数字大的账号稳定顶到前面）</label><div class="hint">关：退化为纯负载均衡，忽略账号优先级；同优先级内仍按区域 / 预计等待兜底</div></div>
       ${fld("s_tier","生图默认档位", s.default_image_tier||"1k","text")}
       ${fld("s_retry","最大重试次数", s.retry_max??3,"number","生图/视频提交不参与 5xx 重试，避免重复扣费")}
       ${fld("s_rbase","退避基数（毫秒）", s.retry_base_backoff_ms??500)}
@@ -821,7 +818,7 @@ function bindSettingsEvents(){
       queue_max_size:Number(g("s_qsize")), keepalive_interval_ms:Number(g("s_keep")),
       image_concurrency:Number(g("s_imconc")), video_max_inflight:Number(g("s_vconc")),
       breaker_revive_sec:Number(g("s_brev")), affinity_mode:g("s_affinity"),
-      region_priority:g("s_region"), default_image_tier:g("s_tier"), retry_max:Number(g("s_retry")),
+      priority_order_mode:document.getElementById("s_priority_mode").checked, default_image_tier:g("s_tier"), retry_max:Number(g("s_retry")),
       retry_base_backoff_ms:Number(g("s_rbase")), retry_max_backoff_ms:Number(g("s_rmax")),
       probe_model:g("s_probe"), session_ttl_hours:Number(g("s_ttl")),
       rpm_global_factor:Number(g("s_rpmg")), rate_limit_retry_max:Number(g("s_r429r")),
