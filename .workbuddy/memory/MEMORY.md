@@ -4,7 +4,7 @@
 - SSH 节点 192.168.100.3，用户 `admin`（**uid=1000，不是 root**，属 Administrators/docker 组），口令在 `D:/work/M365-fpk/.nas_pass`，用 `paramiko.SSHClient()`（5.0.0 精简版，连接类叫 SSHClient 非 Client）。
 - 二进制路径 `/vol1/@appcenter/agnes-hub/app/baipiao-hub`；数据 `/vol1/@appdata/agnes-hub/data`；端口 4142。app id = `agnes-hub`（应用中心显示名「白嫖 Hub」）。
 - **稳健热更三步（2026-10-10 修正，按这个来）**：
-  1. 停服：**PTY sudo** 调 `appcenter-cli stop agnes-hub`（非 PTY 会 panic、且 stop 后进程常残留）→ 取 `pgrep -f baipiao-hub` 的 PID → **PTY sudo `kill -9 <pid>`**（关键修正：admin 非 root，普通 `pkill -9 -f` / `kill -9` **杀不掉**以 agnes-hub 身份运行的进程，实测旧进程 PID 原封不动活着、healthz 一直显示旧版本）→ 等 2~3s 确认 NO_PROC。
+  1. 停服：**PTY sudo** 调 `appcenter-cli stop agnes-hub`（非 PTY 会 panic、且 stop 后进程常残留）→ 取 `pgrep -x baipiao-hub` 的 PID（**必须 `-x` 精确匹配进程名；`-f` 会把 SSH exec_command 自身的 bash 命令行也匹配进来，每次抓到一个瞬时 shell 新 PID，误判残留**）→ **PTY sudo `kill -9 <pid>`**（关键修正：admin 非 root，普通 `pkill -9 -f` / `kill -9` **杀不掉**以 agnes-hub 身份运行的进程，实测旧进程 PID 原封不动活着、healthz 一直显示旧版本）→ 等 2~3s 确认 NO_PROC。
   2. 替换：SFTP 传新二进制到 `/tmp`，然后**普通 `cp -f` 覆盖**（admin 可写该路径，无需 sudo）+ `chown agnes-hub:agnes-hub` + `chmod 755`。
   3. 启动：**PTY sudo** 调 `appcenter-cli start agnes-hub`。
 - PTY sudo 写法（三处通用）：`chan.get_pty(); chan.exec_command("sudo -S "+cmd); chan.send(PW+"\n")`，轮询 `chan.exit_status_ready()`（start 给 60~90s，`stopping/starting...` 动画很长）。
@@ -82,6 +82,9 @@
 
 ## 上游 gzip 大请求体 = 401 误报根因（v1.0.38 定案，勿再默认开启）
 `UpstreamRequestGzip` **必须保持默认 false**。上游 agnes 对大体积（≈>1.7MB）gzip 请求体解压失败时返回误导性 **401 "Invalid token"**（同请求直连不压缩则如实报 400 ContextWindowExceededError，模型窗口 524288 tokens）。401 → OnAuthFailure 禁号 30min → 轮询撞死号 → 池抽干 no_capacity → 客户端干等 = 「会话开头能用、上下文变大后渐变卡死、重启才好」。小请求 gzip 正常，平时无感。若要重开 gzip，必须先对 ≥2MB 请求体做压缩回归测试。配套防护：relay.go attemptOnce 的 401 分支会 isContextOverflowError 识别超长误报并改写 400，不熔断不换站。
+
+## StripContentPolicy 同批默认关闭（v1.0.39 定案，重开先回归测试）
+排障「渐变卡死」期间把一切请求体改写全部摘除以收敛变量：`StripContentPolicy` 默认 true→**false**（v1.0.38 的 gzip 之后第二个、也是最后一个默认开启的改写项）。**注意：默认值改了不会覆盖 NAS settings.json 里显式持久化的 true**——v1.0.39 部署时在停服窗口内同步把线上 settings.json 改成 false 才真正生效。AnthropicPromptCache 本就默认关；`normalizeContentArray`（OpenAI 路径 content array→string）是 schema 兼容必需项，保留勿动。重开条件：先对大体积、多轮、含多个 `<content_policy>` 标签字面量的请求体做回归测试（v1.0.26 曾实证跨字符串误配对打坏 JSON）。
 
 ## 运维铁律：热改 accounts.json / settings.json 必须先停服
 网关停止时会用**内存态覆盖回写**这两个文件——运行中改文件再重启 = 改动被吞（本次连踩两次）。正确顺序：PTY sudo stop → pgrep 确认无进程 → 改文件 → PTY sudo start。
