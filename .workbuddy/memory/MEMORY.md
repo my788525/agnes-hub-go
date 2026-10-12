@@ -79,3 +79,9 @@
 - git commit summary/description 用中文。
 - 站点/工具 UI 文案北美英语（禁 CJK），但思考与回复可用中文。
 - 配图走 Unsplash API 本地化 WebP，不热链 CDN。
+
+## 上游 gzip 大请求体 = 401 误报根因（v1.0.38 定案，勿再默认开启）
+`UpstreamRequestGzip` **必须保持默认 false**。上游 agnes 对大体积（≈>1.7MB）gzip 请求体解压失败时返回误导性 **401 "Invalid token"**（同请求直连不压缩则如实报 400 ContextWindowExceededError，模型窗口 524288 tokens）。401 → OnAuthFailure 禁号 30min → 轮询撞死号 → 池抽干 no_capacity → 客户端干等 = 「会话开头能用、上下文变大后渐变卡死、重启才好」。小请求 gzip 正常，平时无感。若要重开 gzip，必须先对 ≥2MB 请求体做压缩回归测试。配套防护：relay.go attemptOnce 的 401 分支会 isContextOverflowError 识别超长误报并改写 400，不熔断不换站。
+
+## 运维铁律：热改 accounts.json / settings.json 必须先停服
+网关停止时会用**内存态覆盖回写**这两个文件——运行中改文件再重启 = 改动被吞（本次连踩两次）。正确顺序：PTY sudo stop → pgrep 确认无进程 → 改文件 → PTY sudo start。
