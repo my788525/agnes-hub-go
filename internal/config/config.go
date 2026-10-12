@@ -402,7 +402,8 @@ type Settings struct {
 	// 只要上游还在持续吐字节，计时就随数据重置，整条流不限时长；
 	// 仅当连续超过该时长【没有任何新字节】时才判定为卡死并断开。
 	// 非流式请求仍用 RequestTimeoutMS 的整请求墙钟超时，二者互不影响。
-	// 默认 60000；填 0 视为 60s。
+	// 默认 600000（10min）；填 0/负 由 newStreamWatchdog 兜底为 60s。慢推理模型必须给足，
+	// 否则网关会在「上游思考 >阈值秒才吐首 token」时把流掐断（2026-10-12 实证卡死根因）。
 	StreamIdleTimeoutMS int    `json:"stream_idle_timeout_ms"`
 	// UsageLogMaxLines 是 usage.jsonl 保留的最大行数（按最近 N 行滚动截断，
 	// 防止长期挂机把磁盘写满）。默认 20000；填 0 表示不限。
@@ -545,7 +546,7 @@ func DefaultSettings() Settings {
 		RegionPriority:      "cn_first",
 		RequestTimeoutMS:    30000, // 默认 30s 上游请求超时
 		FreeTextRPM:         10,    // agnes 免费档文本池标称 RPM（可配置）
-		StreamIdleTimeoutMS: 60000, // 流式空闲看门狗：连续 60s 无新字节才断开
+		StreamIdleTimeoutMS: 600000, // 流式空闲看门狗：连续 10min 无新字节才断开（2026-10-12 由 60s 上调——推理模型难任务思考常 >90s，60s 会在中途把流掐断致客户端卡死）
 		UsageLogMaxLines:    20000,  // usage.jsonl 滚动保留最大行数
 		UsageRequestLogBytes: 512,   // 日志「用户完整请求」保留字节上限
 		RateLimitRetryMax:     6,      // 429 网关内部自动重试次数上限（换账号+重新排队）
