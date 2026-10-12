@@ -29,7 +29,7 @@ import (
 	"agneshub/internal/web"
 )
 
-var version = "1.0.36"
+var version = "1.0.37"
 
 func env(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -149,6 +149,16 @@ func main() {
 		// 视频提交与长回答的 SSE 流可能持续很久，超时会把正常任务掐断。
 		IdleTimeout: 120 * time.Second,
 	}
+	// 关闭服务端 keep-alive：每个请求走独立 TCP 连接（响应带 Connection: close）。
+	// 根因（2026-10-12 用户 A/B 实测证实）：网关进程一旦重启 / 热更，所有已建立的
+	// keep-alive 连接被服务端掐断，但客户端（WorkBuddy）连接池仍认为这些连接存活，
+	// 下一轮请求会把数据写进「半死连接」黑洞，触发 TCP 重传超时（十几分钟），
+	// 表现为「思考中 / 生成回复中」长时间无进展、且网关侧 accepted / pending 全为 0。
+	// 关掉 keep-alive 后，客户端每次请求都新建连接到「当前运行中的进程」，彻底消除
+	// 跨重启的半死连接复用——代价仅是局域网内一次 TCP 握手（<1ms），对 LLM 流式 /
+	// 请求场景可忽略。该设置仅作用于「客户端→网关」下行连接，不影响网关→上游
+	// （agnes）的连接复用（由 relay.BuildClientForAccounts 的 http.Client 独立管理）。
+	httpSrv.SetKeepAlivesEnabled(false)
 
 	settings := store.SettingsSnapshot()
 	enabled := 0

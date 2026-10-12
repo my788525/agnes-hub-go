@@ -8,7 +8,7 @@
    5) 校验 healthz version
 按记忆「稳健热更三步」实现；appcenter-cli 命令一律 PTY sudo，普通 cp/chown 用 admin 直写。
 """
-import os, sys, time
+import os, re, sys, time
 try:
     import paramiko
 except ImportError:
@@ -22,7 +22,23 @@ APP_ID = "agnes-hub"
 APP_BIN = "/vol1/@appcenter/%s/app/baipiao-hub" % APP_ID
 DATA_DIR = "/vol1/@appdata/%s" % APP_ID
 PORT_NUM = 4142
-EXPECT_VER = "1.0.36"
+
+def _read_version():
+    """期望版本从 main.go 的 `var version` 动态读取——版本号单一来源，
+    硬编码会在每次提版本后误报「部署失败」。"""
+    main_go = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.go")
+    try:
+        with open(main_go, encoding="utf-8") as f:
+            m = re.search(r'var\s+version\s*=\s*"([^"]+)"', f.read())
+        if m:
+            return m.group(1)
+    except OSError:
+        pass
+    return None
+
+EXPECT_VER = _read_version()
+if not EXPECT_VER:
+    sys.exit("[ERROR] 无法从 main.go 读取版本号")
 
 def load_password():
     if os.path.exists(FALLBACK_PASS):
