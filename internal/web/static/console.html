@@ -888,9 +888,12 @@ function viewSettings(){
         <option value="none" ${s.affinity_mode==="none"?"selected":""}>不粘性（纯负载均衡）</option>
       </select><div class="hint">绑定账号拥堵（预计等待 &gt; 3s）或冷却时自动改派并更新绑定</div></div>
       <div><label>站点优先级（401/403 自动换站）</label><select id="s_region">
-        <option value="cn_first" ${s.region_priority!=="com_first"?"selected":""}>国内优先（api.example.cn 优先，不通则切国际）</option>
-        <option value="com_first" ${s.region_priority==="com_first"?"selected":""}>国际优先（api.example.com 优先，不通则切国内）</option>
-      </select><div class="hint">API Key 被 401/403 拒绝时自动切到另一站点重试，成功后持久化该账号的 base_url</div></div>
+        <option value="cn_first" ${s.region_priority==="cn_first"||!s.region_priority?"selected":""}>国内优先（api.agnes-ai.cn 优先，401/403 自动切国际）</option>
+        <option value="com_first" ${s.region_priority==="com_first"?"selected":""}>国际优先（api.agnes-ai.com 优先，401/403 自动切国内）</option>
+        <option value="cn_only" ${s.region_priority==="cn_only"?"selected":""}>仅国内（永远只打国内站，401/403 不换站直接熔断）</option>
+        <option value="com_only" ${s.region_priority==="com_only"?"selected":""}>仅国际（永远只打国际站，401/403 不换站直接熔断）</option>
+        <option value="random" ${s.region_priority==="random"?"selected":""}>随机选择（每次请求随机选国内/国际一站，401/403 自动切另一站）</option>
+      </select><div class="hint">cn_first / com_first / random：API Key 被 401/403 拒绝时自动切到另一官方站点重发同一账号，成功后持久化该账号的 base_url；cn_only / com_only：只打指定站点，不换站</div></div>
       ${fld("s_tier","生图默认档位", s.default_image_tier||"1k","text")}
       ${fld("s_retry","最大重试次数", s.retry_max??3,"number","生图/视频提交不参与 5xx 重试，避免重复扣费")}
       ${fld("s_rbase","退避基数（毫秒）", s.retry_base_backoff_ms??500)}

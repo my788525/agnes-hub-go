@@ -271,13 +271,69 @@ func UpstreamRoot(a *config.Account) string {
 	return strings.TrimRight(base, "/")
 }
 
-// UpstreamURL 拼接上游完整 URL。
-func UpstreamURL(a *config.Account, path string) string {
-	root := UpstreamRoot(a)
+// joinUpstreamURL 把站点根与端点路径拼成完整 URL（统一去除根尾部 / 与 /v1 后缀，
+// 避免重复拼接 /v1 的 404 坑）。
+func joinUpstreamURL(root, path string) string {
+	root = strings.TrimRight(strings.TrimSpace(root), "/")
+	root = strings.TrimSuffix(root, "/v1")
+	root = strings.TrimRight(root, "/")
 	if strings.HasPrefix(path, "/") {
 		return root + path
 	}
 	return root + "/" + path
+}
+
+// UpstreamURL 拼接上游完整 URL。
+func UpstreamURL(a *config.Account, path string) string {
+	return joinUpstreamURL(UpstreamRoot(a), path)
+}
+
+// UpstreamURLForRoot 用显式给定的站点根（而非账号 BaseURL）拼完整 URL。
+// 站点优先级「自动换站」时，用同一把 Key 重发到另一官方站点根。
+func UpstreamURLForRoot(root, path string) string {
+	return joinUpstreamURL(root, path)
+}
+
+// ---------------------------------------------------------------------------
+// 站点优先级（RegionPriority）—— 401/403 自动换站
+// ---------------------------------------------------------------------------
+
+// relayRand 是「随机选择」站点模式用的随机数源（仅用于选站，无需加密强度）。
+var relayRand = rand.New(rand.NewSource(time.Now().UnixNano()))
+
+// sitePlan 计算某次请求应使用的上游站点策略。
+//   - primary：本次主用站点 URL（带 /v1 归一化）；非官方站点（amd / openrouter）
+//     保持账号原 base_url，不参与换站。
+//   - swappable：该账号属于官方双站点、且当前模式允许 401/403 换站时为 true。
+type sitePlan struct {
+	primary   string
+	swappable bool
+}
+
+// planSite 依据站点优先级模式与账号 base_url 生成本次请求的站点策略。
+// 非官方站点（amd / openrouter 等）不归双站点管辖，保持原 URL、不可换站。
+func planSite(account *config.Account, mode string) sitePlan {
+	home := config.OfficialSite(account.BaseURL)
+	if home == "" {
+		return sitePlan{primary: account.BaseURL, swappable: false}
+	}
+	switch mode {
+	case "cn_only": // 仅国内：永远只打国内站，且 401/403 不换站
+		return sitePlan{primary: config.CNBaseURL, swappable: false}
+	case "com_only": // 仅国际：永远只打国际站，且 401/403 不换站
+		return sitePlan{primary: config.DefaultBaseURL, swappable: false}
+	case "com_first": // 国际优先：账号原站点为主，401/403 可切国内
+		return sitePlan{primary: account.BaseURL, swappable: true}
+	case "cn_first": // 国内优先：账号原站点为主，401/403 可切国际
+		return sitePlan{primary: account.BaseURL, swappable: true}
+	case "random": // 随机选择：每次请求随机取一站，401/403 可切另一站
+		if relayRand.Intn(2) == 0 {
+			return sitePlan{primary: config.CNBaseURL, swappable: true}
+		}
+		return sitePlan{primary: config.DefaultBaseURL, swappable: true}
+	default: // 未知模式回落国内优先，但仍允许换站（与旧 cn_first 行为一致）
+		return sitePlan{primary: account.BaseURL, swappable: true}
+	}
 }
 
 // ClientHeaders 构造上游请求头。
@@ -630,8 +686,6 @@ func softFailGiveUp(r *Result, kind respKind, tried int) *Result {
 func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *config.Account,
 	opts Options, body []byte, modelUsed string, totalWaitMS int64, attemptNo int) (*Result, bool, error) {
 
-	url := UpstreamURL(account, opts.Path)
-
 	// P0: 请求超时保护。
 	//   - 非流式：整请求墙钟超时（RequestTimeoutMS），上游 hang 住会耗尽连接池，必须限时；
 	//   - 流式：改为「空闲看门狗」——从请求发起起计时，只要 StreamIdleTimeoutMS 内没有
@@ -678,154 +732,214 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 		}
 	}
 
-	var (
-		reqCtx context.Context
-		cancel context.CancelFunc
-	)
-	if opts.Stream {
-		reqCtx, cancel = context.WithCancel(ctx)
-	} else {
-		reqCtx, cancel = context.WithTimeout(ctx, time.Duration(timeoutMS)*time.Millisecond)
+	// 站点优先级（RegionPriority）：生成本次请求的「候选站点」列表。
+	// cn_first / com_first / random 模式下，401/403 会自动切到列表里的下一站重发同一账号；
+	// cn_only / com_only 模式 swappable=false，401/403 直接熔断、不换站。
+	plan := planSite(account, s.RegionPriority)
+	candidateRoots := []string{plan.primary}
+	candidateURLs := []string{UpstreamURLForRoot(plan.primary, opts.Path)}
+	if plan.swappable {
+		if alt := config.AlternateOfficialURL(plan.primary); alt != "" {
+			candidateRoots = append(candidateRoots, alt)
+			candidateURLs = append(candidateURLs, UpstreamURLForRoot(alt, opts.Path))
+		}
 	}
 
-	req, err := http.NewRequestWithContext(reqCtx, opts.Method, url, bytes.NewReader(sendBody))
-	if err != nil {
-		cancel() // P2：request 构造失败时也取消 context，避免泄漏（vet 提示）。
-		return nil, false, err
-	}
-	for k, values := range ClientHeaders(account, opts.ExtraHeaders, opts.Anthropic) {
-		req.Header[k] = values
-	}
-	// P1：已对请求体做 gzip 压缩，声明编码并让 Go 按压缩后字节数自动设 Content-Length。
-	if gzipEncode {
-		req.Header.Set("Content-Encoding", "gzip")
-	}
-
-	// 单账号并发上限（按模态分离，避免视频轮询挤占文本请求）
+	// 单账号并发上限（按模态分离，避免视频轮询挤占文本请求）。整个 attemptOnce
+	// 只占一个并发槽（即便换站也还是同一账号、同一逻辑请求）。
 	sem := h.Semaphore(account, pool.ModalityOfPool(opts.PoolClass))
 	select {
 	case sem <- struct{}{}:
 	case <-ctx.Done():
-		cancel() // 取消请求 context（ctx 已被外部取消，显式释放派生 context 避免泄漏）
 		return nil, false, ctx.Err()
 	}
 
-	// 流式请求：启动空闲看门狗（覆盖首字节等待）。client.Do 阻塞在响应头阶段，
-	// 若上游迟迟不回响应头 / 连接建立后无数据，看门狗会在 idleMS 后 cancel 断开。
-	var wd *streamWatchdog
-	if opts.Stream {
-		wd = newStreamWatchdog(cancel, time.Duration(idleMS)*time.Millisecond)
-		wd.arm()
-	}
+	// 逐站点尝试：首页命中 401/403 且允许换站时，用同一把 Key 切到下一站重发，
+	// 客户端任务因此不被「站点级凭据被拒」打断；切站成功会持久化该账号的 base_url。
+	var lastAuth *Result
+	for i, tryURL := range candidateURLs {
+		// 每次尝试用独立的派生 context（非流式带墙钟超时、流式带空闲看门狗），
+		// 换站重试不会复用上一站已取消/超时的 context。
+		var iterCtx context.Context
+		var iterCancel context.CancelFunc
+		if opts.Stream {
+			iterCtx, iterCancel = context.WithCancel(ctx)
+		} else {
+			iterCtx, iterCancel = context.WithTimeout(ctx, time.Duration(timeoutMS)*time.Millisecond)
+		}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		<-sem
+		req, err := http.NewRequestWithContext(iterCtx, opts.Method, tryURL, bytes.NewReader(sendBody))
+		if err != nil {
+			iterCancel() // P2：request 构造失败时也取消 context，避免泄漏（vet 提示）。
+			<-sem
+			return nil, false, err
+		}
+		for k, values := range ClientHeaders(account, opts.ExtraHeaders, opts.Anthropic) {
+			req.Header[k] = values
+		}
+		// P1：已对请求体做 gzip 压缩，声明编码并让 Go 按压缩后字节数自动设 Content-Length。
+		if gzipEncode {
+			req.Header.Set("Content-Encoding", "gzip")
+		}
+
+		// 流式请求：启动空闲看门狗（覆盖首字节等待）。client.Do 阻塞在响应头阶段，
+		// 若上游迟迟不回响应头 / 连接建立后无数据，看门狗会在 idleMS 后 cancel 断开。
+		var wd *streamWatchdog
+		if opts.Stream {
+			wd = newStreamWatchdog(iterCancel, time.Duration(idleMS)*time.Millisecond)
+			wd.arm()
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			if wd != nil {
+				wd.stop()
+			}
+			// 连接层失败：若还能换站（还有候选站点），切站重发（某站宕机/网络不通时正是
+			// 自动换站能救的场景）；否则按旧逻辑返回 502，由 doOnce 换号重试。
+			if i < len(candidateURLs)-1 {
+				h.NoteError(account, fmt.Sprintf("连接失败(%s)，尝试换站：%T: %v", tryURL, err, err))
+				iterCancel()
+				continue
+			}
+			iterCancel()
+			<-sem
+			h.NoteError(account, fmt.Sprintf("%T: %v", err, err))
+			h.Metrics.RequestsError.Add(1)
+			return &Result{
+				Status:  http.StatusBadGateway,
+				Header:  http.Header{"Content-Type": []string{"application/json"}},
+				Body:    errorBody(fmt.Sprintf("上游连接失败：%v", err), "upstream_error"),
+				Account: account, ModelUsed: modelUsed, WaitMS: totalWaitMS, Attempts: attemptNo,
+			}, true, nil
+		}
+
+		status := resp.StatusCode
 		if wd != nil {
-			wd.stop()
+			// 响应头已到达：重置空闲计时，进入「流式体」阶段继续看门狗。
+			wd.arm()
 		}
-		cancel()
-		h.NoteError(account, fmt.Sprintf("%T: %v", err, err))
-		h.Metrics.RequestsError.Add(1)
+
+		if status == 402 {
+			// 402 Payment Required：该账号额度耗尽。不再「不重试」——
+			// 额度是【按账号】的，池子里别的号往往还有额度，必须换号再试；
+			// 全部耗尽后 Pick 会失败，由 doOnce 交还最后那次真实的 402。
+			// （402 是账号额度问题，换站无意义，故不走换站重试。）
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			if wd != nil {
+				wd.stop()
+			}
+			<-sem
+			iterCancel()
+			h.NoteError(account, fmt.Sprintf("HTTP %d: %s", status, string(raw)))
+			h.Metrics.RequestsError.Add(1)
+			return &Result{
+				Status: status, Header: SanitizeHeaders(resp.Header), Body: raw,
+				Account: account, ModelUsed: modelUsed, WaitMS: totalWaitMS, Attempts: attemptNo,
+			}, true, nil
+		}
+
+		if AuthFailStatus[status] { // 401 / 403 凭据被拒
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			if wd != nil {
+				wd.stop()
+			}
+			// 还有另一官方站点可试（cn_first / com_first / random 且本账号属官方双站）：
+			// 不立即熔断，用同一把 Key 切站重发同一请求，客户端任务不被站点级凭据错打断。
+			if i < len(candidateURLs)-1 {
+				h.NoteError(account, fmt.Sprintf("HTTP %d（%s）凭据被拒，尝试换站重发", status, tryURL))
+				h.Metrics.RequestsError.Add(1)
+				iterCancel()
+				lastAuth = &Result{
+					Status: status, Header: SanitizeHeaders(resp.Header), Body: raw,
+					Account: account, ModelUsed: modelUsed, WaitMS: totalWaitMS, Attempts: attemptNo,
+				}
+				continue
+			}
+			// 两站都拒：原 401/403 熔断逻辑（该账号 Key 在两站均不可用，熔断以待自动复活）。
+			<-sem
+			iterCancel()
+			h.OnAuthFailure(account, fmt.Sprintf("HTTP %d: %s", status, string(raw)))
+			return &Result{
+				Status: status, Header: SanitizeHeaders(resp.Header), Body: raw,
+				Account: account, ModelUsed: modelUsed, WaitMS: totalWaitMS, Attempts: attemptNo,
+			}, true, nil
+		}
+
+		if status == http.StatusTooManyRequests {
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			if wd != nil {
+				wd.stop()
+			}
+			<-sem
+			iterCancel()
+			h.OnRateLimited(account, opts.PoolClass)
+			return &Result{
+				Status: status, Header: SanitizeHeaders(resp.Header), Body: raw,
+				Account: account, ModelUsed: modelUsed, WaitMS: totalWaitMS, Attempts: attemptNo,
+			}, true, nil
+		}
+
+		if RetryableStatus[status] {
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+			resp.Body.Close()
+			if wd != nil {
+				wd.stop()
+			}
+			<-sem
+			iterCancel()
+			h.NoteError(account, fmt.Sprintf("HTTP %d: %s", status, string(raw)))
+			return &Result{
+				Status: status, Header: SanitizeHeaders(resp.Header), Body: raw,
+				Account: account, ModelUsed: modelUsed, WaitMS: totalWaitMS, Attempts: attemptNo,
+			}, true, nil
+		}
+
+		// 换站成功后持久化该账号的 base_url 为本次成功站点（控制台 hint 承诺的行为：
+		// 自动切站生效即把账号固定到可用站点，后续请求不再多一次换站开销）。
+		if i > 0 {
+			if root := config.NormalizeBaseURL(candidateRoots[i]); root != "" {
+				h.SetAccountBaseURL(account.ID, root+"/v1")
+			}
+		}
+
+		// 交给调用方消费：包一层以便在关闭时释放并发信号量并取消 context。
+		// 注意：成功路径【绝不】在此提前关闭 body 或取消 iterCtx，否则调用方读取 body 时
+		// 连接已关闭 / context 已取消，会读到空体（表现为网关回 {}）。
+		// 直到调用方读完 body 触发 Close()，才在此 release 里 cancel()。
+		var streamBody io.ReadCloser = resp.Body
+		if opts.Stream {
+			// 流式：body 上套 idleStreamBody（读到字节就 wd.arm() 重置看门狗），
+			// 与前面 client.Do 阶段启动的看门狗衔接，连续 idleMS 无任何字节才断开。
+			streamBody = &idleStreamBody{ReadCloser: resp.Body, wd: wd}
+		}
+		wrapped := &releaseOnClose{ReadCloser: streamBody, release: func() {
+			iterCancel() // body 读取完毕后才取消 context
+			select {
+			case <-sem:
+			default:
+			}
+		}}
 		return &Result{
-			Status:  http.StatusBadGateway,
-			Header:  http.Header{"Content-Type": []string{"application/json"}},
-			Body:    errorBody(fmt.Sprintf("上游连接失败：%v", err), "upstream_error"),
+			Status: status, Header: SanitizeHeaders(resp.Header), Stream: wrapped,
 			Account: account, ModelUsed: modelUsed, WaitMS: totalWaitMS, Attempts: attemptNo,
-		}, true, nil
+		}, false, nil
 	}
 
-	status := resp.StatusCode
-	if wd != nil {
-		// 响应头已到达：重置空闲计时，进入「流式体」阶段继续看门狗。
-		wd.arm()
+	// 兜底：两站都失败但循环正常结束（AuthFail 末轮已 return，正常不至此）。
+	if lastAuth != nil {
+		return lastAuth, true, nil
 	}
-
-	if status == 402 {
-		// 402 Payment Required：该账号额度耗尽。不再「不重试」——
-		// 额度是【按账号】的，池子里别的号往往还有额度，必须换号再试；
-		// 全部耗尽后 Pick 会失败，由 doOnce 交还最后那次真实的 402。
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		resp.Body.Close()
-		if wd != nil {
-			wd.stop()
-		}
-		<-sem
-		cancel()
-		h.NoteError(account, fmt.Sprintf("HTTP %d: %s", status, string(raw)))
-		h.Metrics.RequestsError.Add(1)
-		return &Result{
-			Status: status, Header: SanitizeHeaders(resp.Header), Body: raw,
-			Account: account, ModelUsed: modelUsed, WaitMS: totalWaitMS, Attempts: attemptNo,
-		}, true, nil
-	}
-
-	if AuthFailStatus[status] { // 401 / 403
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		resp.Body.Close()
-		if wd != nil {
-			wd.stop()
-		}
-		<-sem
-		cancel()
-		h.OnAuthFailure(account, fmt.Sprintf("HTTP %d: %s", status, string(raw)))
-		return &Result{
-			Status: status, Header: SanitizeHeaders(resp.Header), Body: raw,
-			Account: account, ModelUsed: modelUsed, WaitMS: totalWaitMS, Attempts: attemptNo,
-		}, true, nil
-	}
-
-	if status == http.StatusTooManyRequests {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		resp.Body.Close()
-		if wd != nil {
-			wd.stop()
-		}
-		<-sem
-		cancel()
-		h.OnRateLimited(account, opts.PoolClass)
-		return &Result{
-			Status: status, Header: SanitizeHeaders(resp.Header), Body: raw,
-			Account: account, ModelUsed: modelUsed, WaitMS: totalWaitMS, Attempts: attemptNo,
-		}, true, nil
-	}
-
-	if RetryableStatus[status] {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		resp.Body.Close()
-		if wd != nil {
-			wd.stop()
-		}
-		<-sem
-		cancel()
-		h.NoteError(account, fmt.Sprintf("HTTP %d: %s", status, string(raw)))
-		return &Result{
-			Status: status, Header: SanitizeHeaders(resp.Header), Body: raw,
-			Account: account, ModelUsed: modelUsed, WaitMS: totalWaitMS, Attempts: attemptNo,
-		}, true, nil
-	}
-
-	// 交给调用方消费：包一层以便在关闭时释放并发信号量并取消 context。
-	// 注意：成功路径【绝不】在此提前关闭 body 或取消 reqCtx，否则调用方读取 body 时
-	// 连接已关闭 / context 已取消，会读到空体（表现为网关回 {}）。
-	// 直到调用方读完 body 触发 Close()，才在此 release 里 cancel()。
-	var streamBody io.ReadCloser = resp.Body
-	if opts.Stream {
-		// 流式：body 上套 idleStreamBody（读到字节就 wd.arm() 重置看门狗），
-		// 与前面 client.Do 阶段启动的看门狗衔接，连续 idleMS 无任何字节才断开。
-		streamBody = &idleStreamBody{ReadCloser: resp.Body, wd: wd}
-	}
-	wrapped := &releaseOnClose{ReadCloser: streamBody, release: func() {
-		cancel() // body 读取完毕后才取消 context
-		select {
-		case <-sem:
-		default:
-		}
-	}}
+	<-sem
 	return &Result{
-		Status: status, Header: SanitizeHeaders(resp.Header), Stream: wrapped,
+		Status:  http.StatusBadGateway,
+		Header:  http.Header{"Content-Type": []string{"application/json"}},
+		Body:    errorBody("上游两站均不可用", "upstream_error"),
 		Account: account, ModelUsed: modelUsed, WaitMS: totalWaitMS, Attempts: attemptNo,
-	}, false, nil
+	}, true, nil
 }
 
 type releaseOnClose struct {

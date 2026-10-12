@@ -85,6 +85,84 @@ func IsCNHost(baseURL string) bool {
 	return strings.Contains(strings.ToLower(baseURL), "agnes-ai.cn")
 }
 
+// ---------------------------------------------------------------------------
+// 站点优先级（RegionPriority）—— 控制「优先用哪个官方站点」与「401/403 自动换站」
+//
+// 官方同时存在两个站点：国际站 apihub.agnes-ai.com（DefaultBaseURL）与
+// 国内站 api.agnes-ai.cn（CNBaseURL）。同一把 API Key 在两站都可能有效，
+// 但某一站返回 401/403（凭据被拒）时，另一站往往可用。故新增「自动换站」：
+// 401/403 时网关自动用同一把 Key 重发到另一站点，成功后持久化该账号的 base_url，
+// 客户端任务因此不被一次站点级凭据错误打断。
+// ---------------------------------------------------------------------------
+
+// RegionModes 是站点优先级（RegionPriority）的合法取值。
+//   - cn_first  国内优先（默认）：优先国内站；401/403 自动切国际站重发同一账号
+//   - com_first 国际优先：优先国际站；401/403 自动切国内站重发同一账号
+//   - cn_only   仅国内：永远只打国内站；401/403 不换站，直接熔断
+//   - com_only  仅国际：永远只打国际站；401/403 不换站，直接熔断
+//   - random    随机选择：每次请求随机选国内/国际一站；401/403 自动切到另一站重发
+var RegionModes = []string{"cn_only", "com_only", "cn_first", "com_first", "random"}
+
+// RegionLabel 是各模式的展示名（控制台 / 日志用）。
+var RegionLabel = map[string]string{
+	"cn_only":  "仅国内",
+	"com_only": "仅国际",
+	"cn_first": "国内优先",
+	"com_first": "国际优先",
+	"random":   "随机选择",
+}
+
+// SiteCN / SiteCom 是官方双站点的标识。
+const (
+	SiteCN  = "cn"
+	SiteCom = "com"
+)
+
+// OfficialSite 判断 baseURL 属于哪个官方 agnes 站点：返回 SiteCN / SiteCom /
+// 空串（非官方站点，例如 amd / openrouter，无法参与换站）。
+func OfficialSite(baseURL string) string {
+	u := strings.ToLower(strings.TrimRight(strings.TrimSpace(baseURL), "/"))
+	u = strings.TrimSuffix(u, "/v1")
+	if strings.Contains(u, "agnes-ai.cn") {
+		return SiteCN
+	}
+	if strings.Contains(u, "agnes-ai.com") {
+		return SiteCom
+	}
+	return ""
+}
+
+// AlternateOfficialURL 若 baseURL 是官方 agnes 站点，返回另一官方站点的完整 /v1 URL；
+// 否则返回空串（非官方站点没有可换的站，例如 amd / openrouter 直接熔断）。
+func AlternateOfficialURL(baseURL string) string {
+	switch OfficialSite(baseURL) {
+	case SiteCN:
+		return DefaultBaseURL
+	case SiteCom:
+		return CNBaseURL
+	default:
+		return ""
+	}
+}
+
+// IsValidRegionPriority 校验站点优先级取值是否合法。
+func IsValidRegionPriority(mode string) bool {
+	for _, m := range RegionModes {
+		if m == mode {
+			return true
+		}
+	}
+	return false
+}
+
+// NormalizeBaseURL 把任意写法的 base_url 归一化为「站点根」（去掉尾部 / 与 /v1 后缀），
+// 供持久化换站结果时统一存储口径。
+func NormalizeBaseURL(baseURL string) string {
+	u := strings.TrimSpace(baseURL)
+	u = strings.TrimSuffix(strings.TrimRight(u, "/"), "/v1")
+	return strings.TrimRight(u, "/")
+}
+
 // stringInSlice 检查字符串是否在切片中。
 func StringInSlice(s string, list []string) bool {
 	for _, v := range list {
@@ -290,8 +368,11 @@ type Settings struct {
 	KeepaliveMS          int                `json:"keepalive_interval_ms"`
 	AffinityMode         string             `json:"affinity_mode"`
 	DefaultImageTier     string             `json:"default_image_tier"`
-	// RegionPriority 站点优先级：cn_first（国内优先）或 com_first（国际优先）。
-	// 401/403 凭据被拒时自动切换到另一站点的 BaseURL 重试同一账号。
+	// RegionPriority 站点优先级：cn_first（国内优先）/ com_first（国际优先）/
+	// cn_only（仅国内）/ com_only（仅国际）/ random（随机选择）。
+	// cn_first / com_first / random 模式下，401/403 凭据被拒时自动切换到另一官方
+	// 站点的 BaseURL 重试同一账号（成功后持久化该账号的 base_url）；
+	// cn_only / com_only 模式不换站，401/403 直接熔断该账号。
 	RegionPriority       string             `json:"region_priority,omitempty"`
 	ModelAliases         map[string]string  `json:"model_aliases"`
 	AutoModelName        string             `json:"auto_model_name"`
@@ -892,6 +973,10 @@ func normalizeSettings(v *Settings) {
 	}
 	if v.UsageRequestLogBytes <= 0 {
 		v.UsageRequestLogBytes = d.UsageRequestLogBytes
+	}
+	// 站点优先级：旧配置缺该字段、或写入了非法取值时归到默认的「国内优先」。
+	if !IsValidRegionPriority(v.RegionPriority) {
+		v.RegionPriority = d.RegionPriority
 	}
 	// 情景模式：旧配置缺该字段时归到 default（不改任何旋钮，仅记录名）。
 	if v.Scenario == "" {

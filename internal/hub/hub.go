@@ -862,7 +862,18 @@ type PickResult struct {
 // 而区域优先级退化为同优先级内的次级偏好（与「cn_first / com_first」语义一致）。
 func (h *Hub) pickWithPriority(poolClass string, exclude map[string]bool, requiredModel string) *config.Account {
 	s := h.Settings()
-	primaryCN := s.RegionPriority != "com_first" // 默认 cn_first
+	// regionBias = 站点优先级是否参与排序；random 模式不做区域偏向（每次请求
+	// 由 relay 随机选站，排序本就不应再按区域偏袒）。
+	regionBias := true
+	primaryCN := true // 默认 cn_first
+	switch s.RegionPriority {
+	case "com_only", "com_first":
+		primaryCN = false
+	case "cn_only", "cn_first":
+		primaryCN = true
+	default: // random / 未知 → 不按区域排序
+		regionBias = false
+	}
 
 	bestAcc := (*config.Account)(nil)
 	bestScore := pickScore{}
@@ -872,7 +883,7 @@ func (h *Hub) pickWithPriority(poolClass string, exclude map[string]bool, requir
 		sc := pickScore{
 			priority:    a.Priority,
 			budgetTier:  h.budgetTier(a, s.RoutingMode),
-			regionMatch: config.IsCNHost(a.BaseURL) == primaryCN,
+			regionMatch: !regionBias || config.IsCNHost(a.BaseURL) == primaryCN,
 			sessions:    bindCnt[a.ID],
 			wait:        h.Pacer(a, poolClass).ProjectedWait(),
 			inflight:    h.Inflight(a.ID),
@@ -1380,6 +1391,19 @@ func (h *Hub) NoteSuccess(a *config.Account) {
 	h.Metrics.RequestsOK.Add(1)
 	// P1-4：全局最近成功时间戳（/healthz last_success_age_ms）。
 	h.Metrics.LastSuccessNS.Store(time.Now().UnixNano())
+}
+
+// SetAccountBaseURL 把某账号的 base_url 改写到真身（内存），由维护循环 FlushAccounts
+// 周期落盘。供 relay 的「401/403 自动换站成功后持久化可用站点」使用：账号在另一官方
+// 站点凭证可用时，把该账号固定到该站点，后续请求不再多一次换站开销。
+func (h *Hub) SetAccountBaseURL(id, baseURL string) {
+	h.store.MutateAccountNoSave(id, func(a *config.Account) bool {
+		if a.BaseURL == baseURL {
+			return false
+		}
+		a.BaseURL = baseURL
+		return true
+	})
 }
 
 // ChargeBudget 记录一次成功请求消耗的预算（neurons 或 tokens），推进日预算累计。

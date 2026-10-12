@@ -1324,6 +1324,18 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 		return
 	case <-time.After(keepalive):
 	case <-ctx.Done():
+		// 客户端在等待首字节期间断开（典型：用户在长任务里「停止」再继续）：
+		// relay.Do 仍在后台 Goroutine 跑，最终会把 *Result 推入带缓冲的 ch。
+		// 若此处直接 return，无人消费该 result → 其上游连接与并发信号量槽位
+		// 永久泄漏。长期如此会让首选账号的 sem 被占满、所有请求卡在 Acquire
+		// 无限等待（只有重启网关才能恢复）——正是「渐变卡死、无报错、重启才好转」的根因。
+		// 故必须把它取出来 Close，释放上游连接与信号量槽位。
+		go func() {
+			out := <-ch
+			if out.result != nil {
+				out.result.Close()
+			}
+		}()
 		return
 	}
 
@@ -1373,6 +1385,17 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 		case <-ticker.C:
 			writeSSEComment(w, flusher, "agnes-hub waiting for rate-limit slot")
 		case <-ctx.Done():
+			// 与首字节等待窗口（上方 1326 处）同款泄漏：客户端在「心跳等待」期间
+			// 断开时，relay.Do 仍会把 *Result 推入带缓冲的 ch 而无人消费 → 上游连接
+			// 与并发信号量槽位永久泄漏，长期累积即复现「渐变卡死、无报错、重启才好转」。
+			// 这是稳态等待路径（上游迟迟不回首字节时一直停在这里），比首字节窗口更易触发，
+			// 故同样必须把 result 取出来 Close 释放。
+			go func() {
+				out := <-ch
+				if out.result != nil {
+					out.result.Close()
+				}
+			}()
 			return
 		}
 	}
