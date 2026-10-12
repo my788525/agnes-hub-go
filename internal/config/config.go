@@ -469,10 +469,10 @@ type Settings struct {
 	// 兼容 Anthropic 前缀缓存时生效；不兼容时该字段被忽略，内容不受影响（见 #29）。
 	AnthropicPromptCache bool `json:"anthropic_prompt_cache"`
 	// StripContentPolicy 开启后，网关在把请求体发给上游前，剥离 WorkBuddy 客户端
-	// 注入的 <content_policy> 段（纯字符串替换，~0.1ms/请求，远轻于 gzip 的 1ms）。
-	// 目的不是省速度，而是省 token：高轮次会话里该段每轮重复、约占 100~400 词，
-	// 剥离可削减送模型的正文量。默认 true（省 token；对 <user_query> 真实输入与
-	// 其余字段零改动）；若需保留原始正文送上游可手动关闭（setopt strip_content_policy off）。
+	// 注入的 <content_policy> 段（JSON 字符串感知的字节替换）。原本默认 true 是为省
+	// token；2026-10-12 起默认 false：客户端报「渐变卡死」排障期间，把一切请求体改写
+	// 全部摘除以收敛变量（gzip 已同批默认关闭）。确认稳定后如需重开，必须先对大体积、
+	// 多轮、含多个标签字面量的请求体做回归测试（v1.0.26 曾实证跨字符串误配对打坏 JSON）。
 	StripContentPolicy bool `json:"strip_content_policy"`
 	// RoutingMode 决定「有日预算的用量型账号（如 Cloudflare）」与「无天花板的速率型账号
 	// （如 agnes）」混挂时谁先被吃：
@@ -559,8 +559,9 @@ func DefaultSettings() Settings {
 		// #29 反悔（2026-10-12 实测）：gzip 默认关闭——上游对大体积 gzip 请求体
 		// 返回误导性 401，触发账号熔断级联（详见字段注释）。要开先做 ≥2MB 回归测试。
 		UpstreamRequestGzip: false,
-		// 默认剥离客户端注入的 <content_policy> 段以省 token（对 user_query 真实输入零改动）。
-		StripContentPolicy: true,
+		// 默认不剥离：2026-10-12 排障「渐变卡死」，与 gzip 同批摘除一切请求体改写以
+		// 收敛变量。确认稳定后如需重开（省 token），先做大体积/多标签字面量回归测试。
+		StripContentPolicy: false,
 		// 混挂「用量型（CF 有日预算）」与「速率型（agnles 无天花板）」时：agnles 扛主力、
 		// CF 兜底且烧光自动出局。这是最稳的挂机默认。
 		RoutingMode: "rate_first",
